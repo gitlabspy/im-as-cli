@@ -1,0 +1,14 @@
+node_modules/
+dist/
+.env
+.env.*
+*.log
+*.tgz
+coverage/
+*.tsbuildinfo
+*.js
+*.d.ts
+*.js.map
+*.d.ts.map
+!src/**/*.js
+.DS_Store

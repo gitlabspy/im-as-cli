@@ -1,0 +1,56 @@
+{
+  "name": "remote-agent-control-skill",
+  "version": "0.1.0",
+  "description": "Claude Code/Codex Skill: control local coding agents from IM platforms (Telegram, Discord, Feishu/Lark, QQ, WeChat)",
+  "license": "MIT",
+  "type": "module",
+  "keywords": [
+    "remote-agent-control",
+    "claude-code",
+    "codex",
+    "skill",
+    "telegram",
+    "discord",
+    "feishu",
+    "lark",
+    "qq",
+    "wechat",
+    "bridge"
+  ],
+  "scripts": {
+    "build": "node scripts/build.js",
+    "typecheck": "tsc --noEmit",
+    "dev": "tsx src/main.ts",
+    "weixin:login": "node --import tsx src/weixin-login.ts",
+    "test": "node scripts/run-tests.mjs"
+  },
+  "files": [
+    "SKILL.md",
+    "README.md",
+    "README_CN.md",
+    "LICENSE",
+    "config.env.example",
+    "references",
+    "scripts",
+    "src",
+    "tsconfig.json",
+    "!src/__tests__"
+  ],
+  "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "^0.2.62",
+    "remote-agent-control-core": "file:../Claude-to-IM",
+    "qrcode": "^1.5.4"
+  },
+  "optionalDependencies": {
+    "@openai/codex-sdk": "^0.110.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22",
+    "esbuild": "^0.25.0",
+    "tsx": "^4.21.0",
+    "typescript": "^5"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

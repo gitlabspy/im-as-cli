@@ -1,0 +1,12 @@
+node_modules/
+dist/
+*.tgz
+.env
+.env.*
+config.env
+*.log
+coverage/
+runtime/
+.claude-to-im/
+*.tsbuildinfo
+.DS_Store

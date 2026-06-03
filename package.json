@@ -1,0 +1,20 @@
+{
+  "name": "remote-agent-control-workspace",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Source workspace for the Remote Agent Control core bridge library and Claude Code/Codex skill.",
+  "license": "MIT",
+  "scripts": {
+    "install:all": "npm install --prefix Claude-to-IM && npm install --prefix Claude-to-IM-skill",
+    "install:codex": "bash scripts/install-codex.sh",
+    "install:codex:windows": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts\\install-codex.ps1",
+    "install:claude": "bash scripts/install-claude.sh",
+    "install:claude:windows": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts\\install-claude.ps1",
+    "build": "npm run build --prefix Claude-to-IM && npm run build --prefix Claude-to-IM-skill",
+    "typecheck": "npm run typecheck --prefix Claude-to-IM && npm run typecheck --prefix Claude-to-IM-skill",
+    "test": "npm test --prefix Claude-to-IM && npm test --prefix Claude-to-IM-skill"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
