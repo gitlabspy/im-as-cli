@@ -76,6 +76,23 @@ function shouldRetryFreshThread(message: string): boolean {
   );
 }
 
+function toCodexReasoningEffort(effort?: string): 'low' | 'medium' | 'high' | undefined {
+  return effort === 'low' || effort === 'medium' || effort === 'high'
+    ? effort
+    : undefined;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null;
+}
+
+function eventErrorMessage(event: Record<string, unknown>, fallback: string): string {
+  if (typeof event.message === 'string' && event.message) return event.message;
+  const error = event.error;
+  if (isRecord(error) && typeof error.message === 'string' && error.message) return error.message;
+  return fallback;
+}
+
 export class CodexProvider implements LLMProvider {
   private sdk: CodexModule | null = null;
   private codex: CodexInstance | null = null;
@@ -145,11 +162,15 @@ export class CodexProvider implements LLMProvider {
 
             const threadOptions: Record<string, unknown> = {
               ...(passModel && params.model ? { model: params.model } : {}),
+              ...(toCodexReasoningEffort(params.effort) ? { modelReasoningEffort: toCodexReasoningEffort(params.effort) } : {}),
               ...(params.workingDirectory ? { workingDirectory: params.workingDirectory } : {}),
               ...(shouldSkipGitRepoCheck() ? { skipGitRepoCheck: true } : {}),
               sandboxMode: codexSandbox,
               approvalPolicy,
             };
+            // The current Codex SDK ThreadOptions expose modelReasoningEffort,
+            // but no no-session-persistence equivalent. Ephemeral calls
+            // therefore avoid reuse and provider-side caching only.
 
             // Build input: Codex SDK UserInput supports { type: "text" } and
             // { type: "local_image", path: string }. We write base64 data to
@@ -192,6 +213,7 @@ export class CodexProvider implements LLMProvider {
               let sawAnyEvent = false;
               try {
                 const { events } = await thread.runStreamed(input);
+                let emittedText = '';
 
                 for await (const event of events) {
                   sawAnyEvent = true;
@@ -199,6 +221,7 @@ export class CodexProvider implements LLMProvider {
                     break;
                   }
 
+                  let terminalEvent = false;
                   switch (event.type) {
                     case 'thread.started': {
                       const threadId = event.thread_id as string;
@@ -214,7 +237,7 @@ export class CodexProvider implements LLMProvider {
 
                     case 'item.completed': {
                       const item = event.item as Record<string, unknown>;
-                      self.handleCompletedItem(controller, item);
+                      emittedText += self.handleCompletedItem(controller, item) ?? '';
                       break;
                     }
 
@@ -228,24 +251,65 @@ export class CodexProvider implements LLMProvider {
                           output_tokens: usage.output_tokens ?? 0,
                           cache_read_input_tokens: usage.cached_input_tokens ?? 0,
                         } : undefined,
-                        ...(threadId ? { session_id: threadId } : {}),
-                      }));
+                          ...(threadId ? { session_id: threadId } : {}),
+                        }));
+                      terminalEvent = true;
+                      break;
+                    }
+
+                    case 'session_meta': {
+                      const payload = isRecord(event.payload) ? event.payload : null;
+                      const threadId = typeof payload?.id === 'string' ? payload.id : undefined;
+                      if (threadId) {
+                        if (!params.ephemeral) {
+                          self.threadIds.set(params.sessionId, threadId);
+                        }
+                        controller.enqueue(sseEvent('status', {
+                          session_id: threadId,
+                        }));
+                      }
+                      break;
+                    }
+
+                    case 'event_msg': {
+                      const payload = isRecord(event.payload) ? event.payload : null;
+                      if (payload?.type === 'task_complete') {
+                        const finalText = typeof payload.last_agent_message === 'string'
+                          ? payload.last_agent_message
+                          : '';
+                        if (finalText && !emittedText.endsWith(finalText)) {
+                          controller.enqueue(sseEvent('text', finalText));
+                          emittedText += finalText;
+                        }
+
+                        const threadId = params.ephemeral
+                          ? undefined
+                          : self.threadIds.get(params.sessionId) || savedThreadId;
+                        controller.enqueue(sseEvent('result', {
+                          ...(threadId ? { session_id: threadId } : {}),
+                        }));
+                        terminalEvent = true;
+                      }
                       break;
                     }
 
                     case 'turn.failed': {
-                      const error = (event as { message?: string }).message;
-                      controller.enqueue(sseEvent('error', error || 'Turn failed'));
+                      controller.enqueue(sseEvent('error', eventErrorMessage(event as Record<string, unknown>, 'Turn failed')));
+                      terminalEvent = true;
                       break;
                     }
 
                     case 'error': {
-                      const error = (event as { message?: string }).message;
-                      controller.enqueue(sseEvent('error', error || 'Thread error'));
+                      controller.enqueue(sseEvent('error', eventErrorMessage(event as Record<string, unknown>, 'Thread error')));
+                      terminalEvent = true;
                       break;
                     }
 
                     // item.started, item.updated, turn.started — no action needed
+                  }
+
+                  if (terminalEvent) {
+                    break;
                   }
                 }
                 break;
@@ -288,7 +352,7 @@ export class CodexProvider implements LLMProvider {
   private handleCompletedItem(
     controller: ReadableStreamDefaultController<string>,
     item: Record<string, unknown>,
-  ): void {
+  ): string | undefined {
     const itemType = item.type as string;
 
     switch (itemType) {
@@ -296,6 +360,7 @@ export class CodexProvider implements LLMProvider {
         const text = (item.text as string) || '';
         if (text) {
           controller.enqueue(sseEvent('text', text));
+          return text;
         }
         break;
       }
@@ -375,5 +440,6 @@ export class CodexProvider implements LLMProvider {
         break;
       }
     }
+    return undefined;
   }
 }

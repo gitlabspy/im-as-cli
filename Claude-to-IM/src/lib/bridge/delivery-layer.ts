@@ -25,6 +25,10 @@ const INTER_CHUNK_DELAY_MS = 300;
 /** Shared rate limiter instance (20 messages/minute per chat). */
 const rateLimiter = new ChatRateLimiter();
 
+export function resetDeliveryRateLimiterForTests(): void {
+  rateLimiter.reset();
+}
+
 // Periodically clean up idle rate limiter buckets (every 5 minutes).
 // unref() so the timer doesn't prevent Node.js process exit (e.g. in tests).
 setInterval(() => { rateLimiter.cleanup(); }, 5 * 60_000).unref();

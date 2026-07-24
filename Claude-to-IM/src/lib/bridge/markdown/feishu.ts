@@ -59,19 +59,25 @@ export function buildCardContent(text: string): string {
 export interface FeishuTabsChoiceItem {
   index: number;
   active: boolean;
-  unread: boolean;
-  codepilotSessionId: string;
+  sessionId: string;
   workingDirectory: string;
   backend: string;
   status: string;
+  lastUserQuestion?: string;
+  lastAgentOutput?: string;
   callbackData: string;
 }
 
 export function buildTabsChoiceCard(tabs: FeishuTabsChoiceItem[]): string {
   const lines = tabs.map((tab) => {
-    const active = tab.active ? '▶ ' : '';
-    const unread = tab.unread ? ' · unread' : '';
-    return `${active}**${tab.index}. \`${tab.codepilotSessionId.slice(0, 8)}...\`** [${tab.status}${unread}] ${tab.backend}\n${tab.workingDirectory || '~'}`;
+    return [
+      `**${tab.index}. \`${tab.sessionId}\`**`,
+      `backend: ${tab.backend}`,
+      `cwd: ${tab.workingDirectory || '~'}`,
+      `status: ${tab.status}`,
+      tab.lastUserQuestion ? `user: ${tab.lastUserQuestion}` : '',
+      tab.lastAgentOutput ? `agent: ${tab.lastAgentOutput}` : '',
+    ].filter(Boolean).join('\n');
   });
 
   const buttonRows = [];
@@ -125,6 +131,7 @@ export interface FeishuSearchResultCardInput {
   workingDirectory: string;
   backend: string;
   status: string;
+  isCurrentSession?: boolean;
   reason: string;
   lastUserQuestion?: string;
   lastAgentOutput?: string;
@@ -137,6 +144,7 @@ export function buildSearchResultCard(result: FeishuSearchResultCardInput): stri
     `Query: \`${result.query}\``,
     '',
     `**Match:** \`${result.codepilotSessionId}\``,
+    result.isCurrentSession ? 'Note: This is the current session.' : '',
     `Backend: ${result.backend}`,
     `Status: ${result.status}`,
     `CWD: ${result.workingDirectory || '~'}`,
@@ -189,6 +197,84 @@ export function buildSearchResultCard(result: FeishuSearchResultCardInput): stri
         },
       ],
     },
+  });
+}
+
+export type FeishuPeekRisk = 'running' | 'idle' | 'waiting' | 'error' | 'normal';
+
+export interface FeishuPeekCardInput {
+  status: string;
+  risk: FeishuPeekRisk;
+  backend: string;
+  workingDirectory: string;
+  bridgeSessionId: string;
+  nativeSessionId?: string;
+  model?: string;
+  lastActivity?: string;
+  elapsed?: string;
+  recentAction?: string;
+  summary: string;
+  summarySource: 'model' | 'local';
+  truncated?: boolean;
+}
+
+const PEEK_RISK_TEMPLATE: Record<FeishuPeekRisk, string> = {
+  running: 'blue',
+  idle: 'grey',
+  waiting: 'orange',
+  error: 'red',
+  normal: 'green',
+};
+
+const PEEK_RISK_LABEL: Record<FeishuPeekRisk, string> = {
+  running: '🔄 运行中',
+  idle: '💤 空闲',
+  waiting: '⏳ 等待授权',
+  error: '❌ 出错',
+  normal: '✅ 正常',
+};
+
+/**
+ * Build a Feishu interactive card (schema 2.0) summarizing the current
+ * session for `/peek`. Read-only: no action buttons in v1.
+ */
+export function buildPeekCard(input: FeishuPeekCardInput): string {
+  const fields = [
+    `**状态：** ${input.status}`,
+    `**风险：** ${PEEK_RISK_LABEL[input.risk]}`,
+    `**后端：** ${input.backend}`,
+    `**工作目录：** \`${input.workingDirectory || '~'}\``,
+    input.lastActivity ? `**最近活动：** ${input.lastActivity}` : '',
+    input.elapsed ? `**距上次活动：** ${input.elapsed}` : '',
+    `**Bridge 会话：** \`${input.bridgeSessionId}\``,
+    `**Native 会话：** \`${input.nativeSessionId || '无（全新）'}\``,
+    input.model ? `**模型：** \`${input.model}\`` : '',
+    input.recentAction ? `**最近动作：** ${input.recentAction}` : '',
+  ].filter(Boolean).join('\n');
+
+  const summaryHeading = input.summarySource === 'model' ? '**摘要**' : '**摘要（本地兜底）**';
+  const summaryBody = input.summary || '_暂无可总结的近期活动。_';
+  const notes: string[] = [];
+  if (input.truncated) notes.push('已截断为最近的活动。');
+
+  const elements: Array<Record<string, unknown>> = [
+    { tag: 'markdown', content: fields, text_size: 'normal' },
+    { tag: 'hr' },
+    { tag: 'markdown', content: `${summaryHeading}\n${summaryBody}`, text_size: 'normal' },
+  ];
+  if (notes.length > 0) {
+    elements.push({ tag: 'markdown', content: notes.join('\n'), text_size: 'notation' });
+  }
+
+  return JSON.stringify({
+    schema: '2.0',
+    config: { wide_screen_mode: true },
+    header: {
+      title: { tag: 'plain_text', content: '会话快照' },
+      template: PEEK_RISK_TEMPLATE[input.risk],
+      padding: '12px 12px 12px 12px',
+    },
+    body: { elements },
   });
 }
 
@@ -358,9 +444,8 @@ export function buildFinalCardJson(
     });
   }
 
-  // Footnote: status · elapsed / token / model go into a real `note` element
-  // (card 2.0 footnote component) rather than inlined body text. The
-  // final-reply marker becomes the card header title (see below).
+  // Footer: status · elapsed / token / model go into a separate markdown
+  // element. Feishu Card JSON 2.0 rejects the old `note` element.
   let header: Record<string, unknown> | undefined;
   if (footer) {
     // Header title carries the final-reply marker. Kept as a code-level
@@ -398,8 +483,10 @@ export function buildFinalCardJson(
 
     if (noteLines.length > 0) {
       elements.push({
-        tag: 'note',
-        elements: [{ tag: 'lark_md', content: noteLines.join('  ·  ') }],
+        tag: 'markdown',
+        content: noteLines.join('  ·  '),
+        text_align: 'left',
+        text_size: 'normal',
       });
     }
   }
@@ -466,6 +553,98 @@ export function buildPermissionButtonCard(
         {
           tag: 'markdown',
           content: 'Or reply: `1` Allow · `2` Allow Session · `3` Deny',
+          text_size: 'notation',
+        },
+      ],
+    },
+  });
+}
+
+export interface FeishuQuestionChoice {
+  index: number;
+  label: string;
+  description?: string;
+}
+
+/**
+ * Build an AskUserQuestion card: the question in the body, one button per
+ * option, plus an "其他（自定义回复）" button for free-form input to the agent.
+ * Option callbacks: `perm:choice:<index>:<permId>`; the custom button uses
+ * `perm:choice_other:<permId>`.
+ */
+export function buildQuestionCard(
+  questionText: string,
+  choices: FeishuQuestionChoice[],
+  permissionRequestId: string,
+  chatId?: string,
+): string {
+  const optionLines = choices
+    .map((choice) => {
+      const desc = choice.description ? ` — ${choice.description}` : '';
+      return `**${choice.index}.** ${choice.label}${desc}`;
+    })
+    .join('\n');
+
+  const optionButtons = choices.map((choice) => ({
+    tag: 'column',
+    width: 'auto',
+    elements: [{
+      tag: 'button',
+      text: { tag: 'plain_text', content: `${choice.index}. ${choice.label}` },
+      type: 'primary',
+      size: 'medium',
+      value: { callback_data: `perm:choice:${choice.index}:${permissionRequestId}`, ...(chatId ? { chatId } : {}) },
+    }],
+  }));
+
+  // Chunk option buttons into rows of up to 3 columns.
+  const buttonRows: Array<Record<string, unknown>> = [];
+  for (let start = 0; start < optionButtons.length; start += 3) {
+    buttonRows.push({
+      tag: 'column_set',
+      flex_mode: 'none',
+      horizontal_align: 'left',
+      columns: optionButtons.slice(start, start + 3),
+    });
+  }
+
+  const otherButtonRow = {
+    tag: 'column_set',
+    flex_mode: 'none',
+    horizontal_align: 'left',
+    columns: [{
+      tag: 'column',
+      width: 'auto',
+      elements: [{
+        tag: 'button',
+        text: { tag: 'plain_text', content: '其他（自定义回复）' },
+        type: 'default',
+        size: 'medium',
+        value: { callback_data: `perm:choice_other:${permissionRequestId}`, ...(chatId ? { chatId } : {}) },
+      }],
+    }],
+  };
+
+  return JSON.stringify({
+    schema: '2.0',
+    config: { wide_screen_mode: true },
+    header: {
+      title: { tag: 'plain_text', content: '需要你的选择' },
+      template: 'blue',
+      icon: { tag: 'standard_icon', token: 'chat-question_filled' },
+      padding: '12px 12px 12px 12px',
+    },
+    body: {
+      elements: [
+        { tag: 'markdown', content: questionText, text_size: 'normal' },
+        { tag: 'hr' },
+        { tag: 'markdown', content: optionLines, text_size: 'normal' },
+        ...buttonRows,
+        otherButtonRow,
+        { tag: 'hr' },
+        {
+          tag: 'markdown',
+          content: '点击按钮，或直接回复编号（如 `1`）；选择「其他」后发送自定义内容给 agent。5 分钟后过期。',
           text_size: 'notation',
         },
       ],

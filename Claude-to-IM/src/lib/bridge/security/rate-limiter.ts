@@ -66,6 +66,10 @@ export class ChatRateLimiter {
     }
   }
 
+  reset(): void {
+    this.buckets.clear();
+  }
+
   private getOrCreate(chatId: string): BucketEntry {
     let bucket = this.buckets.get(chatId);
     if (!bucket) {

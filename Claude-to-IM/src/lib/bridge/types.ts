@@ -145,6 +145,8 @@ export interface BridgeSessionTab {
   nativeSource?: 'claude' | 'codex';
   lastUserQuestion?: string;
   lastAgentOutput?: string;
+  /** Last real user/assistant chat activity; metadata/status updates must not change this. */
+  activityAt?: string;
   createdAt: string;
   updatedAt: string;
 }

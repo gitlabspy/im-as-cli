@@ -76,6 +76,9 @@ export class CopilotProvider implements LLMProvider {
           ? undefined
           : self.sessionIds.get(params.sessionId) || params.sdkSessionId || undefined;
 
+        // GitHub Copilot CLI has no supported effort flag in this provider.
+        // params.effort is intentionally a no-op here.
+
         // Sandbox gating:
         //   'ro'   → always --no-tools (binding overrides env)
         //   'rw'   → env-driven (CTI_COPILOT_ALLOW_TOOLS=true unlocks tools)

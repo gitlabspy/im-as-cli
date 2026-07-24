@@ -20,10 +20,12 @@ import { deliver, deliverRendered } from './delivery-layer.js';
 import { markdownToTelegramChunks } from './markdown/telegram.js';
 import { markdownToDiscordChunks } from './markdown/discord.js';
 import { splitFinalReply, splitFinalReplyBody } from './markdown/split.js';
-import { buildFinalCardJson, buildFinalReplyFooterText, buildSearchResultCard, buildTabsChoiceCard, formatElapsed } from './markdown/feishu.js';
+import { buildFinalCardJson, buildFinalReplyFooterText, buildPeekCard, buildSearchResultCard, buildTabsChoiceCard, formatElapsed } from './markdown/feishu.js';
+import type { FeishuPeekRisk } from './markdown/feishu.js';
 import { getBridgeContext } from './context.js';
 import { escapeHtml } from './adapters/telegram-utils.js';
-import { listNativeSessionTabs } from './native-session-index.js';
+import { findNativeSessionTranscriptSnippets, listNativeSessionTabs, readNativeSessionTranscriptTail } from './native-session-index.js';
+import type { NativeSessionTranscriptTail } from './native-session-index.js';
 import {
   validateWorkingDirectory,
   validateSessionId,
@@ -102,15 +104,27 @@ function tabLaneKey(bindingId: string, tab: BridgeSessionTab): string {
 const NATIVE_SESSION_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$/;
 const DEFAULT_TABS_LIMIT = 10;
 const MAX_TABS_LIMIT = 50;
+const TABS_SNIPPET_CHARS = 20;
 const SEARCH_AGENT_MAX_CANDIDATES = MAX_TABS_LIMIT;
 const SEARCH_DEFAULT_LIMIT = 10;
 const SEARCH_AGENT_HISTORY_LIMIT = 6;
 const SEARCH_AGENT_CONTEXT_CHARS = 900;
 const SEARCH_LAST_USER_QUESTION_CHARS = 300;
 const SEARCH_LAST_AGENT_OUTPUT_CHARS = 300;
+const SEARCH_NATIVE_TRANSCRIPT_SNIPPET_CHARS = 300;
+const SEARCH_NATIVE_TRANSCRIPT_SNIPPETS = 3;
 const SEARCH_AGENT_TIMEOUT_MS = 45_000;
 const SEARCH_RESULT_TTL_MS = 10 * 60_000;
 const SEARCH_AGENT_MIN_CONFIDENCE = 0.2;
+
+// ── /peek constants ───────────────────────────────────────────
+const PEEK_TAIL_ENTRIES = 50;
+const PEEK_TAIL_CHARS = 20_000;
+const PEEK_TAIL_ENTRY_CHARS = 800;
+/** Hard cap on the transcript text handed to the summarizer prompt. */
+const PEEK_PROMPT_TRANSCRIPT_CHARS = 6_000;
+const PEEK_SUMMARY_MAX_CHARS = 1_200;
+const PEEK_AGENT_TIMEOUT_MS = 30_000;
 
 function validateNativeSessionId(id: string): boolean {
   return NATIVE_SESSION_ID_PATTERN.test(id.trim());
@@ -151,6 +165,24 @@ function tabUpdatedAtMs(tab: BridgeSessionTab): number {
   return Number.isFinite(value) ? value : 0;
 }
 
+function tabActivityAtMs(tab: BridgeSessionTab): number {
+  const value = Date.parse(tab.activityAt ?? tab.createdAt);
+  return Number.isFinite(value) ? value : 0;
+}
+
+function tabHasChatActivity(tab: BridgeSessionTab): boolean {
+  const value = Date.parse(tab.activityAt ?? '');
+  return Number.isFinite(value);
+}
+
+function tabBackendSessionId(tab: BridgeSessionTab): string | undefined {
+  const backend = tabBackend(tab);
+  return tab.nativeSessionId
+    || tab.backendSdkSessionIds?.[backend]
+    || tab.sdkSessionId
+    || undefined;
+}
+
 function currentBackendRecentSessionTabs(
   binding: ChannelBinding,
   tabs: BridgeSessionTab[],
@@ -160,7 +192,7 @@ function currentBackendRecentSessionTabs(
   return [...tabs]
     .filter((tab) => tabBackend(tab) === backend)
     .sort((left, right) => {
-      const diff = tabUpdatedAtMs(right) - tabUpdatedAtMs(left);
+      const diff = tabActivityAtMs(right) - tabActivityAtMs(left);
       if (diff !== 0) return diff;
       return right.id.localeCompare(left.id);
     })
@@ -168,8 +200,41 @@ function currentBackendRecentSessionTabs(
 }
 
 function tabIdentityKey(tab: BridgeSessionTab): string {
-  if (tab.nativeSessionId) return `${tabBackend(tab)}:native:${tab.nativeSessionId}`;
-  return `${tabBackend(tab)}:${tab.codepilotSessionId}`;
+  const backendSessionId = tabBackendSessionId(tab);
+  if (backendSessionId) return `${tabBackend(tab)}:${backendSessionId}`;
+  return `${tabBackend(tab)}:bridge:${tab.codepilotSessionId}`;
+}
+
+function hasBridgeWrapper(tab: BridgeSessionTab): boolean {
+  return !tab.codepilotSessionId.startsWith('native:');
+}
+
+function mergeSessionTabsByIdentity(left: BridgeSessionTab, right: BridgeSessionTab): BridgeSessionTab {
+  const leftHasWrapper = hasBridgeWrapper(left);
+  const rightHasWrapper = hasBridgeWrapper(right);
+  if (leftHasWrapper !== rightHasWrapper) {
+    const wrapper = leftHasWrapper ? left : right;
+    const backendSession = leftHasWrapper ? right : left;
+    const activityAt = tabActivityAtMs(wrapper) > tabActivityAtMs(backendSession)
+      ? wrapper.activityAt
+      : backendSession.activityAt;
+    return {
+      ...backendSession,
+      ...wrapper,
+      nativeSessionId: backendSession.nativeSessionId ?? tabBackendSessionId(wrapper),
+      nativeSource: backendSession.nativeSource ?? wrapper.nativeSource,
+      lastUserQuestion: backendSession.lastUserQuestion ?? wrapper.lastUserQuestion,
+      lastAgentOutput: backendSession.lastAgentOutput ?? wrapper.lastAgentOutput,
+      activityAt,
+      updatedAt: tabUpdatedAtMs(wrapper) > tabUpdatedAtMs(backendSession)
+        ? wrapper.updatedAt
+        : backendSession.updatedAt,
+    };
+  }
+
+  return tabUpdatedAtMs(right) > tabUpdatedAtMs(left)
+    ? { ...left, ...right }
+    : { ...right, ...left };
 }
 
 function dedupeSessionTabsByIdentity(tabs: BridgeSessionTab[]): BridgeSessionTab[] {
@@ -177,14 +242,16 @@ function dedupeSessionTabsByIdentity(tabs: BridgeSessionTab[]): BridgeSessionTab
   for (const tab of tabs) {
     const key = tabIdentityKey(tab);
     const existing = byIdentity.get(key);
-    if (!existing || tabUpdatedAtMs(tab) > tabUpdatedAtMs(existing)) {
+    if (!existing) {
       byIdentity.set(key, tab);
+    } else {
+      byIdentity.set(key, mergeSessionTabsByIdentity(existing, tab));
     }
   }
   return [...byIdentity.values()];
 }
 
-function mergedCurrentBackendRecentSessionTabs(binding: ChannelBinding, limit: number): BridgeSessionTab[] {
+function mergedSessionTabCandidates(binding: ChannelBinding, nativeLimit: number): BridgeSessionTab[] {
   const { store } = getBridgeContext();
   const allBindings = store.listChannelBindings();
   const bindings = allBindings.some((candidate) => candidate.id === binding.id)
@@ -193,12 +260,24 @@ function mergedCurrentBackendRecentSessionTabs(binding: ChannelBinding, limit: n
   const bridgeCandidates = bindings.flatMap(readSessionTabsForListing);
   const nativeCandidates = listNativeSessionTabs({
     backend: getActiveBackend(binding),
-    limit: Math.min(limit, MAX_TABS_LIMIT),
+    limit: Math.min(nativeLimit, MAX_TABS_LIMIT),
     maxSnippetChars: SEARCH_LAST_AGENT_OUTPUT_CHARS,
   });
+  return dedupeSessionTabsByIdentity([...bridgeCandidates, ...nativeCandidates]);
+}
+
+function mergedCurrentBackendRecentSessionTabs(binding: ChannelBinding, limit: number): BridgeSessionTab[] {
   return currentBackendRecentSessionTabs(
     binding,
-    dedupeSessionTabsByIdentity([...bridgeCandidates, ...nativeCandidates]),
+    mergedSessionTabCandidates(binding, limit),
+    limit,
+  );
+}
+
+function mergedCurrentBackendRecentChatSessionTabs(binding: ChannelBinding, limit: number): BridgeSessionTab[] {
+  return currentBackendRecentSessionTabs(
+    binding,
+    mergedSessionTabCandidates(binding, MAX_TABS_LIMIT).filter(tabHasChatActivity),
     limit,
   );
 }
@@ -219,6 +298,7 @@ function readSessionTabsForListing(binding: ChannelBinding): BridgeSessionTab[] 
       bufferedAt: existing.bufferedAt,
       unread: existing.unread ?? false,
       createdAt: existing.createdAt,
+      activityAt: existing.activityAt,
       updatedAt: existing.updatedAt,
     });
   } else {
@@ -233,7 +313,7 @@ function readSessionTabsForListing(binding: ChannelBinding): BridgeSessionTab[] 
 }
 
 function listCurrentBackendRecentSessionTabs(binding: ChannelBinding, limit: number): BridgeSessionTab[] {
-  return mergedCurrentBackendRecentSessionTabs(binding, limit);
+  return mergedCurrentBackendRecentChatSessionTabs(binding, limit);
 }
 
 function tabListingKey(binding: ChannelBinding): string {
@@ -287,6 +367,7 @@ function snapshotBindingAsTab(
     bufferedAt: overrides.bufferedAt,
     unread: overrides.unread ?? false,
     createdAt: overrides.createdAt ?? binding.createdAt ?? now,
+    activityAt: overrides.activityAt,
     updatedAt: overrides.updatedAt ?? now,
   };
 }
@@ -307,6 +388,8 @@ function normalizeSessionTabs(binding: ChannelBinding): BridgeSessionTab[] {
       bufferedAt: existing.bufferedAt,
       unread: existing.unread ?? false,
       createdAt: existing.createdAt,
+      activityAt: existing.activityAt,
+      updatedAt: existing.updatedAt,
     });
   } else {
     tabs.push(snapshotBindingAsTab(binding, { id: binding.codepilotSessionId }));
@@ -374,6 +457,11 @@ function getTabRuntimeStatus(binding: ChannelBinding, tab: BridgeSessionTab): Br
   return tab.status ?? 'idle';
 }
 
+function isCurrentSessionTab(binding: ChannelBinding, tab: BridgeSessionTab): boolean {
+  const activeId = binding.activeSessionTabId ?? binding.codepilotSessionId;
+  return tab.id === activeId || tab.codepilotSessionId === binding.codepilotSessionId;
+}
+
 function makeTabSwitchCallbackData(binding: ChannelBinding, tab: BridgeSessionTab): string {
   return `tabs:switch:${encodeURIComponent(binding.id)}:${encodeURIComponent(tab.id)}`;
 }
@@ -394,19 +482,43 @@ function parseTabSwitchCallbackData(callbackData: string): { bindingId: string; 
   }
 }
 
+function buildTabSnippets(tab: BridgeSessionTab): { lastUserQuestion?: string; lastAgentOutput?: string } {
+  const { store } = getBridgeContext();
+  const messages = store.getMessages(tab.codepilotSessionId).messages;
+  const lastUserQuestion = [...messages]
+    .reverse()
+    .find((message) => message.role.toLowerCase() === 'user' && extractSearchText(message.content));
+  const lastAgentOutput = [...messages]
+    .reverse()
+    .find((message) => message.role.toLowerCase() === 'assistant' && extractSearchText(message.content));
+  const userText = lastUserQuestion
+    ? extractSearchText(lastUserQuestion.content)
+    : tab.lastUserQuestion;
+  const agentText = lastAgentOutput
+    ? extractSearchText(lastAgentOutput.content)
+    : tab.lastAgentOutput;
+  return {
+    lastUserQuestion: userText ? truncateSearchText(userText, TABS_SNIPPET_CHARS) : undefined,
+    lastAgentOutput: agentText ? truncateSearchText(agentText, TABS_SNIPPET_CHARS) : undefined,
+  };
+}
+
 function buildTabsText(binding: ChannelBinding, tabs: BridgeSessionTab[]): string {
-  const activeId = binding.activeSessionTabId;
   const lines = ['<b>Tabs</b>', ''];
   tabs.forEach((tab, index) => {
-    const active = tab.id === activeId ? '>' : ' ';
     const status = getTabRuntimeStatus(binding, tab);
-    const unread = tab.unread ? ' unread' : '';
     const backend = tab.backend ?? 'claudecode';
-    lines.push(
-      `${index + 1}. ${active} <code>${escapeHtml(tab.codepilotSessionId.slice(0, 8))}...</code> ` +
-      `[${escapeHtml(status ?? 'idle')}${unread}] ${escapeHtml(backend)} ` +
-      `<code>${escapeHtml(tab.workingDirectory || '~')}</code>`,
-    );
+    const sessionId = tabBackendSessionId(tab) ?? tab.codepilotSessionId;
+    const snippets = buildTabSnippets(tab);
+    const tabLines = [
+      `${index + 1}. <code>${escapeHtml(sessionId)}</code> ` +
+      `backend=<b>${escapeHtml(backend)}</b> ` +
+      `cwd=<code>${escapeHtml(tab.workingDirectory || '~')}</code> ` +
+      `status=<b>${escapeHtml(status ?? 'idle')}</b>`,
+      snippets.lastUserQuestion ? `   user=<code>${escapeHtml(snippets.lastUserQuestion)}</code>` : '',
+      snippets.lastAgentOutput ? `   agent=<code>${escapeHtml(snippets.lastAgentOutput)}</code>` : '',
+    ].filter(Boolean);
+    lines.push(tabLines.join('\n'));
   });
   lines.push('', 'Use /tab &lt;n&gt; to switch, /pop to show buffered output.');
   return lines.join('\n');
@@ -423,11 +535,11 @@ async function sendTabsChoiceCard(
   const cardJson = buildTabsChoiceCard(tabs.map((tab, index) => ({
     index: index + 1,
     active: tab.id === activeId,
-    unread: tab.unread ?? false,
-    codepilotSessionId: tab.codepilotSessionId,
+    sessionId: tabBackendSessionId(tab) ?? tab.codepilotSessionId,
     workingDirectory: tab.workingDirectory,
     backend: tab.backend ?? 'claudecode',
     status: getTabRuntimeStatus(binding, tab) ?? 'idle',
+    ...buildTabSnippets(tab),
     callbackData: makeTabSwitchCallbackData(binding, tab),
   })));
   const result = await adapter.sendInteractiveCard(msg.address, cardJson, msg.messageId);
@@ -464,7 +576,7 @@ function switchToSessionTab(
 }
 
 function materializeNativeSessionTab(binding: ChannelBinding, tab: BridgeSessionTab): BridgeSessionTab {
-  if (!tab.nativeSessionId) return tab;
+  if (!tab.nativeSessionId || hasBridgeWrapper(tab)) return tab;
   const { store } = getBridgeContext();
   const backend = tab.backend ?? getActiveBackend(binding);
   const existing = binding.sessionTabs?.find((candidate) =>
@@ -511,6 +623,8 @@ interface SearchResultState {
 interface SearchPick {
   candidate: SearchCandidate;
   reason: string;
+  keywordEvidence?: string;
+  similarityEvidence?: string;
 }
 
 function searchResultCallbackData(action: 'confirm' | 'again', token: string): string {
@@ -571,15 +685,21 @@ function truncateSearchText(text: string, maxChars: number): string {
 
 function buildSearchCandidates(
   binding: ChannelBinding,
+  query: string,
   excludeTabIds: Set<string>,
   limit: number,
 ): SearchCandidate[] {
   const { store } = getBridgeContext();
-  const activeId = binding.activeSessionTabId ?? binding.codepilotSessionId;
-  const tabs = listCurrentBackendRecentSessionTabs(binding, Math.min(limit + 1, MAX_TABS_LIMIT))
-    .filter((tab) => tab.id !== activeId && tab.codepilotSessionId !== binding.codepilotSessionId)
-    .filter((tab) => !excludeTabIds.has(tab.id) && !excludeTabIds.has(tab.codepilotSessionId))
-    .slice(0, Math.min(limit, SEARCH_AGENT_MAX_CANDIDATES));
+  const candidates = listCurrentBackendRecentSessionTabs(binding, Math.min(limit + 1, MAX_TABS_LIMIT))
+    .filter((tab) => !excludeTabIds.has(tab.id) && !excludeTabIds.has(tab.codepilotSessionId));
+  const otherTabs = candidates.filter((tab) => !isCurrentSessionTab(binding, tab));
+  const currentTabs = excludeTabIds.size === 0
+    ? candidates.filter((tab) => isCurrentSessionTab(binding, tab)).slice(0, 1)
+    : [];
+  const tabs = [
+    ...otherTabs.slice(0, Math.min(limit, SEARCH_AGENT_MAX_CANDIDATES)),
+    ...currentTabs,
+  ];
 
   return tabs.map((tab, index) => {
     const messages = store.getMessages(tab.codepilotSessionId).messages;
@@ -604,12 +724,22 @@ function buildSearchCandidates(
       lastUserQuestionText ? `last user question: ${lastUserQuestionText}` : '',
       lastAgentOutputText ? `last agent output: ${lastAgentOutputText}` : '',
     ].filter(Boolean).join('\n');
+    const nativeTranscriptSnippets = tab.nativeSessionId
+      ? findNativeSessionTranscriptSnippets({
+          backend: tabBackend(tab),
+          nativeSessionId: tab.nativeSessionId,
+          query,
+          maxSnippetChars: SEARCH_NATIVE_TRANSCRIPT_SNIPPET_CHARS,
+          maxSnippets: SEARCH_NATIVE_TRANSCRIPT_SNIPPETS,
+        })
+      : [];
     const context = [
       `session=${tab.codepilotSessionId}`,
       tab.nativeSessionId ? `nativeSession=${tab.nativeSessionId}` : '',
       `backend=${tab.backend ?? 'claudecode'}`,
       `cwd=${tab.workingDirectory || '~'}`,
       `status=${getTabRuntimeStatus(binding, tab) ?? 'idle'}`,
+      nativeTranscriptSnippets.length > 0 ? `native transcript keyword matches:\n${nativeTranscriptSnippets.map((snippet) => `- ${snippet}`).join('\n')}` : '',
       recentMessages ? `recent messages:\n${recentMessages}` : summaryLines || 'recent messages: none',
     ].filter(Boolean).join('\n');
     return { index: index + 1, tab, context, lastUserQuestion: lastUserQuestionText, lastAgentOutput: lastAgentOutputText };
@@ -624,9 +754,11 @@ function buildSearchPrompt(query: string, candidates: SearchCandidate[]): string
   return [
     'You are selecting the single most relevant existing coding-agent session for a user search query.',
     'Use only the candidate summaries below. Do not call tools. Return only compact JSON.',
-    'Schema: {"index": number, "confidence": number, "reason": string}',
+    'Schema: {"index": number, "confidence": number, "keywordEvidence": string, "similarityEvidence": string, "reason": string}',
+    'keywordEvidence must cite matching words or phrases from the query/candidate.',
+    'similarityEvidence must explain semantic similarity from the candidate content.',
     'The reason must be short Chinese text explaining why this session matches.',
-    'If no candidate is relevant, return {"index":0,"confidence":0,"reason":"no relevant session"}.',
+    'If no candidate is relevant, return {"index":0,"confidence":0,"keywordEvidence":"","similarityEvidence":"","reason":"no relevant session"}.',
     '',
     `Query: ${query}`,
     '',
@@ -666,16 +798,34 @@ function parseSearchAgentPick(text: string, candidates: SearchCandidate[]): Sear
   const match = text.match(/\{[\s\S]*\}/);
   if (!match) return null;
   try {
-    const parsed = JSON.parse(match[0]) as { index?: unknown; confidence?: unknown; reason?: unknown };
+    const parsed = JSON.parse(match[0]) as {
+      index?: unknown;
+      confidence?: unknown;
+      keywordEvidence?: unknown;
+      similarityEvidence?: unknown;
+      reason?: unknown;
+    };
     const index = typeof parsed.index === 'number' ? parsed.index : Number.parseInt(String(parsed.index ?? ''), 10);
     const confidence = typeof parsed.confidence === 'number' ? parsed.confidence : Number.parseFloat(String(parsed.confidence ?? '0'));
     if (!Number.isInteger(index) || index < 1 || index > candidates.length) return null;
     if (!Number.isFinite(confidence) || confidence < SEARCH_AGENT_MIN_CONFIDENCE) return null;
+    const keywordEvidence = typeof parsed.keywordEvidence === 'string'
+      ? parsed.keywordEvidence.trim().slice(0, 180)
+      : '';
+    const similarityEvidence = typeof parsed.similarityEvidence === 'string'
+      ? parsed.similarityEvidence.trim().slice(0, 180)
+      : '';
+    const evidenceReason = [
+      keywordEvidence ? `关键词证据：${keywordEvidence}` : '',
+      similarityEvidence ? `内容相似度证据：${similarityEvidence}` : '',
+    ].filter(Boolean).join('；');
     return {
       candidate: candidates[index - 1],
       reason: typeof parsed.reason === 'string' && parsed.reason.trim()
         ? formatChineseSearchReason(parsed.reason.trim().slice(0, 180), '搜索代理匹配')
-        : '搜索代理匹配',
+        : evidenceReason || '搜索代理匹配',
+      keywordEvidence,
+      similarityEvidence,
     };
   } catch {
     return null;
@@ -702,7 +852,12 @@ function localSearchPick(query: string, candidates: SearchCandidate[]): SearchPi
     }
   }
   if (!best) return null;
-  return { candidate: best.candidate, reason: '本地关键词匹配' };
+  return {
+    candidate: best.candidate,
+    reason: '本地关键词匹配',
+    keywordEvidence: tokens.filter((token) => best.candidate.context.toLowerCase().includes(token)).join(', '),
+    similarityEvidence: '候选上下文包含查询关键词',
+  };
 }
 
 async function searchBestSessionTab(
@@ -712,7 +867,7 @@ async function searchBestSessionTab(
   limit: number,
 ): Promise<SearchPick | null> {
   const { llm } = getBridgeContext();
-  const candidates = buildSearchCandidates(binding, excludeTabIds, limit);
+  const candidates = buildSearchCandidates(binding, query, excludeTabIds, limit);
   if (candidates.length === 0) return null;
 
   const abortController = new AbortController();
@@ -724,6 +879,7 @@ async function searchBestSessionTab(
       sessionId: `search-${binding.id}-${Date.now()}`,
       workingDirectory: binding.workingDirectory,
       model: binding.model,
+      effort: 'medium',
       backend: binding.backend,
       permissionMode: 'default',
       sandboxLevel: 'ro',
@@ -748,16 +904,24 @@ function buildSearchResultText(
   retryCallbackData: string,
 ): string {
   const tab = pick.candidate.tab;
+  const isCurrent = isCurrentSessionTab(binding, tab);
   const lines = [
     '<b>Search result</b>',
     `Query: <code>${escapeHtml(query)}</code>`,
     '',
     `Session: <code>${escapeHtml(tab.codepilotSessionId)}</code>`,
+    isCurrent ? 'Note: This is the current session.' : '',
     `Backend: <b>${escapeHtml(tab.backend ?? 'claudecode')}</b>`,
     `Status: <b>${escapeHtml(getTabRuntimeStatus(binding, tab) ?? tab.status ?? 'idle')}</b>`,
     `CWD: <code>${escapeHtml(tab.workingDirectory || '~')}</code>`,
     `Reason: ${escapeHtml(pick.reason)}`,
-  ];
+  ].filter(Boolean);
+  if (pick.keywordEvidence) {
+    lines.push(`Keyword evidence: ${escapeHtml(pick.keywordEvidence)}`);
+  }
+  if (pick.similarityEvidence) {
+    lines.push(`Similarity evidence: ${escapeHtml(pick.similarityEvidence)}`);
+  }
   if (pick.candidate.lastUserQuestion) {
     lines.push(`Last user question: ${escapeHtml(pick.candidate.lastUserQuestion)}`);
   }
@@ -792,6 +956,11 @@ async function sendSearchResult(
   const confirmCallbackData = searchResultCallbackData('confirm', token);
   const retryCallbackData = searchResultCallbackData('again', token);
   const status = getTabRuntimeStatus(binding, pick.candidate.tab) ?? 'idle';
+  const displayReason = [
+    pick.reason,
+    pick.keywordEvidence ? `关键词证据：${pick.keywordEvidence}` : '',
+    pick.similarityEvidence ? `内容相似度证据：${pick.similarityEvidence}` : '',
+  ].filter(Boolean).join('\n');
 
   if (adapter.channelType === 'feishu' && adapter.sendInteractiveCard) {
     const result = await adapter.sendInteractiveCard(
@@ -802,7 +971,8 @@ async function sendSearchResult(
         workingDirectory: pick.candidate.tab.workingDirectory,
         backend: pick.candidate.tab.backend ?? 'claudecode',
         status,
-        reason: pick.reason,
+        isCurrentSession: isCurrentSessionTab(binding, pick.candidate.tab),
+        reason: displayReason,
         lastUserQuestion: pick.candidate.lastUserQuestion,
         lastAgentOutput: pick.candidate.lastAgentOutput,
         confirmCallbackData,
@@ -825,11 +995,267 @@ async function sendSearchResult(
   });
 }
 
+// ── /peek: low-noise session progress snapshot ────────────────
+
+interface PeekData {
+  status: BridgeSessionTab['status'];
+  risk: FeishuPeekRisk;
+  backend: BackendName;
+  workingDirectory: string;
+  bridgeSessionId: string;
+  nativeSessionId: string;
+  model: string;
+  lastActivityAt?: string;
+  elapsed?: string;
+  recentAction?: string;
+  summary: string;
+  summarySource: 'model' | 'local';
+  truncated: boolean;
+  hasNativeSession: boolean;
+}
+
+function classifyPeekRisk(
+  status: BridgeSessionTab['status'],
+  hasPendingPermission: boolean,
+): FeishuPeekRisk {
+  if (hasPendingPermission) return 'waiting';
+  if (status === 'running') return 'running';
+  if (status === 'error') return 'error';
+  if (status === 'unavailable') return 'error';
+  if (status === 'idle') return 'idle';
+  return 'normal';
+}
+
+function peekRiskLabelZh(risk: FeishuPeekRisk): string {
+  switch (risk) {
+    case 'running': return '运行中';
+    case 'idle': return '空闲';
+    case 'waiting': return '等待授权';
+    case 'error': return '出错';
+    default: return '正常';
+  }
+}
+
+function formatPeekActivityElapsed(lastActivityAt?: string): string | undefined {
+  if (!lastActivityAt) return undefined;
+  const parsed = Date.parse(lastActivityAt);
+  if (!Number.isFinite(parsed)) return undefined;
+  const delta = Date.now() - parsed;
+  if (delta < 0) return undefined;
+  return formatElapsed(delta);
+}
+
+/** Build the most recent tool/action label from transcript entries. */
+function peekRecentAction(tail: NativeSessionTranscriptTail): string | undefined {
+  const lastTool = [...tail.entries].reverse().find((entry) => entry.role === 'tool');
+  if (lastTool) return truncateSearchText(`${lastTool.label} ${lastTool.text}`.trim(), 160);
+  const lastAny = tail.entries.at(-1);
+  if (lastAny) return truncateSearchText(`${lastAny.label}: ${lastAny.text}`, 160);
+  return undefined;
+}
+
+function buildPeekTranscriptText(tail: NativeSessionTranscriptTail): string {
+  const lines = tail.entries.map((entry) => `${entry.label}: ${entry.text}`);
+  let text = lines.join('\n');
+  if (text.length > PEEK_PROMPT_TRANSCRIPT_CHARS) {
+    // Keep the most recent tail — truncate from the front.
+    text = `…\n${text.slice(text.length - PEEK_PROMPT_TRANSCRIPT_CHARS)}`;
+  }
+  return text;
+}
+
+function buildPeekPrompt(transcriptText: string): string {
+  return [
+    '你正在为一次状态检查总结某个 coding-agent 会话的近期活动。',
+    '只能使用下面的 transcript 片段，不要调用任何工具，也不要反问。',
+    '用简洁的中文纯文本输出（不要 markdown 标题）。',
+    '需要覆盖：当前在做什么、最近一次具体动作，以及它看起来是在推进、空闲、',
+    '在等待用户输入/授权，还是卡在某个错误上。',
+    `控制在 ${Math.floor(PEEK_SUMMARY_MAX_CHARS / 6)} 字以内。`,
+    '',
+    'Transcript 片段（最近的活动）：',
+    transcriptText,
+  ].join('\n');
+}
+
+function buildPeekLocalSummary(tail: NativeSessionTranscriptTail): string {
+  if (tail.entries.length === 0) return '';
+  const recent = tail.entries.slice(-6).map((entry) => `• ${entry.label}: ${entry.text}`);
+  return truncateSearchText(recent.join('\n'), PEEK_SUMMARY_MAX_CHARS);
+}
+
+async function summarizePeekTranscript(
+  binding: ChannelBinding,
+  tail: NativeSessionTranscriptTail,
+): Promise<{ summary: string; source: 'model' | 'local' }> {
+  const localSummary = buildPeekLocalSummary(tail);
+  if (tail.entries.length === 0) {
+    return { summary: '', source: 'local' };
+  }
+
+  const { llm } = getBridgeContext();
+  const transcriptText = buildPeekTranscriptText(tail);
+  const abortController = new AbortController();
+  const timer = setTimeout(() => abortController.abort(), PEEK_AGENT_TIMEOUT_MS);
+  timer.unref?.();
+  try {
+    const stream = llm.streamChat({
+      prompt: buildPeekPrompt(transcriptText),
+      // Ephemeral, stateless session id — never the active coding-agent session.
+      sessionId: `peek-${binding.id}-${Date.now()}`,
+      workingDirectory: binding.workingDirectory,
+      model: binding.model,
+      effort: 'low',
+      backend: binding.backend,
+      permissionMode: 'default',
+      sandboxLevel: 'ro',
+      abortController,
+      ephemeral: true,
+    });
+    const result = await readLlmText(stream);
+    const text = result.error ? '' : result.text.trim();
+    if (text) {
+      return { summary: truncateSearchText(text, PEEK_SUMMARY_MAX_CHARS), source: 'model' };
+    }
+    return { summary: localSummary, source: 'local' };
+  } catch {
+    return { summary: localSummary, source: 'local' };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function collectPeekData(binding: ChannelBinding): Promise<PeekData> {
+  const { store } = getBridgeContext();
+  const backend = getActiveBackend(binding);
+  const nativeSessionId = getActiveNativeSessionId(binding);
+  const tabs = normalizeSessionTabs(binding);
+  const activeId = binding.activeSessionTabId ?? binding.codepilotSessionId;
+  const activeTab = tabs.find((tab) => tab.id === activeId || tab.codepilotSessionId === binding.codepilotSessionId)
+    ?? snapshotBindingAsTab(binding);
+  const status = getTabRuntimeStatus(binding, activeTab);
+  const hasPendingPermission = store.listPendingPermissionLinksByChat(binding.chatId).length > 0;
+  const risk = classifyPeekRisk(status, hasPendingPermission);
+  const model = binding.model || store.getSession(binding.codepilotSessionId)?.model || '';
+
+  if (!nativeSessionId) {
+    return {
+      status,
+      risk,
+      backend,
+      workingDirectory: binding.workingDirectory,
+      bridgeSessionId: binding.codepilotSessionId,
+      nativeSessionId: '',
+      model,
+      lastActivityAt: activeTab.activityAt,
+      elapsed: formatPeekActivityElapsed(activeTab.activityAt),
+      recentAction: undefined,
+      summary: '',
+      summarySource: 'local',
+      truncated: false,
+      hasNativeSession: false,
+    };
+  }
+
+  const tail = readNativeSessionTranscriptTail({
+    backend,
+    nativeSessionId,
+    maxEntries: PEEK_TAIL_ENTRIES,
+    maxChars: PEEK_TAIL_CHARS,
+    maxEntryChars: PEEK_TAIL_ENTRY_CHARS,
+  });
+  const { summary, source } = await summarizePeekTranscript(binding, tail);
+  const lastActivityAt = tail.lastActivityAt ?? activeTab.activityAt;
+
+  return {
+    status,
+    risk,
+    backend,
+    workingDirectory: tail.workingDirectory || binding.workingDirectory,
+    bridgeSessionId: binding.codepilotSessionId,
+    nativeSessionId,
+    model,
+    lastActivityAt,
+    elapsed: formatPeekActivityElapsed(lastActivityAt),
+    recentAction: peekRecentAction(tail),
+    summary,
+    summarySource: source,
+    truncated: tail.truncated,
+    hasNativeSession: true,
+  };
+}
+
+function peekStatusLabel(status: BridgeSessionTab['status']): string {
+  return status ?? 'idle';
+}
+
+function buildPeekText(data: PeekData): string {
+  const summaryHeading = data.summarySource === 'model' ? '摘要' : '摘要（本地兜底）';
+  const summaryBody = data.hasNativeSession
+    ? (data.summary || '暂无可总结的近期活动。')
+    : '尚未建立 native session。发送一条消息即可开始。';
+  const lines = [
+    '<b>会话快照</b>',
+    '',
+    `状态：<b>${escapeHtml(peekStatusLabel(data.status))}</b>`,
+    `风险：<b>${escapeHtml(peekRiskLabelZh(data.risk))}</b>`,
+    `后端：<b>${escapeHtml(data.backend)}</b>`,
+    `工作目录：<code>${escapeHtml(data.workingDirectory || '~')}</code>`,
+    data.lastActivityAt ? `最近活动：${escapeHtml(data.lastActivityAt)}` : '',
+    data.elapsed ? `距上次活动：${escapeHtml(data.elapsed)}` : '',
+    `Bridge 会话：<code>${escapeHtml(data.bridgeSessionId)}</code>`,
+    `Native 会话：<code>${escapeHtml(data.nativeSessionId || '无（全新）')}</code>`,
+    data.model ? `模型：<code>${escapeHtml(data.model)}</code>` : '',
+    data.recentAction ? `最近动作：${escapeHtml(data.recentAction)}` : '',
+    '',
+    `<b>${summaryHeading}</b>`,
+    escapeHtml(summaryBody),
+    data.truncated ? '已截断为最近的活动。' : '',
+  ].filter(Boolean);
+  return lines.join('\n');
+}
+
+async function sendPeekResult(
+  adapter: BaseChannelAdapter,
+  msg: InboundMessage,
+  data: PeekData,
+): Promise<void> {
+  if (adapter.channelType === 'feishu' && adapter.sendInteractiveCard) {
+    const cardJson = buildPeekCard({
+      status: peekStatusLabel(data.status),
+      risk: data.risk,
+      backend: data.backend,
+      workingDirectory: data.workingDirectory,
+      bridgeSessionId: data.bridgeSessionId,
+      nativeSessionId: data.nativeSessionId || undefined,
+      model: data.model || undefined,
+      lastActivity: data.lastActivityAt,
+      elapsed: data.elapsed,
+      recentAction: data.recentAction,
+      summary: data.hasNativeSession
+        ? data.summary
+        : '尚未建立 native session。发送一条消息即可开始。',
+      summarySource: data.summarySource,
+      truncated: data.truncated,
+    });
+    const result = await adapter.sendInteractiveCard(msg.address, cardJson, msg.messageId);
+    if (result.ok) return;
+  }
+
+  await deliver(adapter, {
+    address: msg.address,
+    text: buildPeekText(data),
+    parseMode: 'HTML',
+    replyToMessageId: msg.messageId,
+  });
+}
+
 function markActiveTabStarted(binding: ChannelBinding): void {
   const tabs = normalizeSessionTabs(binding);
   const activeId = binding.activeSessionTabId ?? binding.codepilotSessionId;
   const activeTab = tabs.find((tab) => tab.id === activeId || tab.codepilotSessionId === binding.codepilotSessionId)
     ?? snapshotBindingAsTab(binding);
+  const activityAt = new Date().toISOString();
   upsertSessionTab(binding, {
     ...activeTab,
     ...snapshotBindingAsTab(binding, {
@@ -839,6 +1265,7 @@ function markActiveTabStarted(binding: ChannelBinding): void {
       bufferedErrorMessage: '',
       bufferedAt: undefined,
       unread: false,
+      activityAt,
     }),
   }, activeTab.id);
 }
@@ -878,6 +1305,7 @@ function recordTabResult(
     bufferedErrorMessage: delivered ? '' : result.errorMessage ?? '',
     bufferedAt: delivered ? undefined : new Date().toISOString(),
     unread: !delivered,
+    activityAt: new Date().toISOString(),
     updatedAt: new Date().toISOString(),
   };
 
@@ -1543,6 +1971,25 @@ async function handleMessage(
   ) {
     // eslint-disable-next-line no-control-regex
     const normalized = rawText.normalize('NFKC').replace(/[\u200B-\u200D\uFEFF]/g, '').trim();
+    // For a single pending QUESTION, accept any 1..N option index. Ordinary
+    // permissions keep the legacy 1/2/3 \u2192 allow/allow_session/deny mapping.
+    const pendingForChat = store.listPendingPermissionLinksByChat(msg.address.chatId);
+    const pendingQuestion = pendingForChat.length === 1 && pendingForChat[0].kind === 'question'
+      ? pendingForChat[0]
+      : null;
+    if (pendingQuestion && /^[1-9][0-9]*$/.test(normalized)) {
+      const index = Number.parseInt(normalized, 10);
+      const callbackData = `perm:choice:${index}:${pendingQuestion.permissionRequestId}`;
+      const handled = await broker.handlePermissionCallback(callbackData, msg.address.chatId);
+      await deliver(adapter, {
+        address: msg.address,
+        text: handled ? `\u5DF2\u9009\u62E9\u7B2C ${index} \u9879\u3002` : '\u9009\u9879\u65E0\u6548\u6216\u95EE\u9898\u5DF2\u5931\u6548\u3002',
+        parseMode: 'plain',
+        replyToMessageId: msg.messageId,
+      });
+      ack();
+      return;
+    }
     if (/^[123]$/.test(normalized)) {
       const pendingLinks = store.listPendingPermissionLinksByChat(msg.address.chatId);
       if (pendingLinks.length === 1) {
@@ -1761,6 +2208,9 @@ async function handleMessage(
           binding.codepilotSessionId,
           perm.suggestions,
           msg.messageId,
+          perm.kind === 'question' && perm.choices && perm.questionText
+            ? { kind: 'question', questionText: perm.questionText, choices: perm.choices }
+            : undefined,
         );
       }, taskAbort.signal, hasAttachments ? msg.attachments : undefined, onPartialText, undefined, onRelayEvent);
     } catch (err) {
@@ -1992,6 +2442,7 @@ async function handleCommand(
         '/tab &lt;n&gt; - Switch logical session',
         '/search &lt;description&gt; [n] - Search recent current-backend sessions',
         '/pop - Show buffered output for current session',
+        '/peek - Summarize current session progress (read-only)',
         '/resume &lt;native_session_id&gt; - Resume current backend native session',
         '/bind &lt;session_id&gt; - Bind to existing session',
         '/cwd /path - Change working directory',
@@ -2241,6 +2692,13 @@ async function handleCommand(
       break;
     }
 
+    case '/peek': {
+      const binding = router.resolve(msg.address);
+      const data = await collectPeekData(binding);
+      await sendPeekResult(adapter, msg, data);
+      return;
+    }
+
     case '/resume': {
       if (!args) {
         response = 'Usage: /resume &lt;native_session_id&gt;';
@@ -2420,8 +2878,52 @@ async function handleCommand(
           bufferedAt: activeTab.bufferedAt,
           unread: activeTab.unread ?? false,
           createdAt: activeTab.createdAt,
+          activityAt: activeTab.activityAt,
         }),
       });
+
+      const nextGen = (binding.backendGeneration ?? 0) + 1;
+      const targetBinding = { ...binding, backend: target };
+      const recentTargetTab = mergedCurrentBackendRecentChatSessionTabs(targetBinding, 1)[0];
+      if (recentTargetTab) {
+        const materialized = materializeNativeSessionTab(targetBinding, recentTargetTab);
+        const targetSdkSessionId = materialized.backendSdkSessionIds?.[target]
+          ?? materialized.sdkSessionId
+          ?? materialized.nativeSessionId
+          ?? '';
+        const nextBackendSessionIds: Partial<Record<BackendName, string>> = {
+          ...(binding.backendSessionIds ?? {}),
+          ...(materialized.backendSessionIds ?? {}),
+          [target]: materialized.codepilotSessionId,
+        };
+        const nextBackendSdkSessionIds: Partial<Record<BackendName, string>> = {
+          ...(binding.backendSdkSessionIds ?? {}),
+          ...(materialized.backendSdkSessionIds ?? {}),
+        };
+        if (targetSdkSessionId) {
+          nextBackendSdkSessionIds[target] = targetSdkSessionId;
+        } else {
+          delete nextBackendSdkSessionIds[target];
+        }
+        const nextTab: BridgeSessionTab = {
+          ...materialized,
+          sdkSessionId: targetSdkSessionId,
+          backend: target,
+          backendGeneration: nextGen,
+          backendSessionIds: nextBackendSessionIds,
+          backendSdkSessionIds: nextBackendSdkSessionIds,
+        };
+        upsertSessionTab(binding, nextTab, nextTab.id);
+        activateSessionTab(binding, nextTab);
+
+        response = [
+          `Backend switched: <b>${escapeHtml(current)}</b> → <b>${escapeHtml(target)}</b>`,
+          `Selected session: <code>${escapeHtml(nextTab.codepilotSessionId.slice(0, 8))}...</code>`,
+          `Generation: ${nextGen}`,
+          'Previous task, if still running, remains in the background.',
+        ].join('\n');
+        break;
+      }
 
       // Resolve (or lazily create) the per-backend session lane id.
       const existingLaneIds: Partial<Record<BackendName, string>> = { ...(binding.backendSessionIds ?? {}) };
@@ -2447,7 +2949,6 @@ async function handleCommand(
         ?? (binding.backendSdkSessionIds ?? {})[target]
         ?? '';
 
-      const nextGen = (binding.backendGeneration ?? 0) + 1;
       const targetTab = tabs.find((tab) => tab.codepilotSessionId === laneSessionId && tab.backend === target)
         ?? snapshotBindingAsTab(binding, {
           id: laneSessionId,
@@ -2600,6 +3101,7 @@ async function handleCommand(
         '/tab &lt;n&gt; - Switch logical session',
         '/search &lt;description&gt; [n] - Search recent current-backend sessions',
         '/pop - Show buffered output for current session',
+        '/peek - Summarize current session progress (read-only)',
         '/resume &lt;native_session_id&gt; - Resume current backend native session',
         '/bind &lt;session_id&gt; - Bind to existing session',
         '/cwd /path - Change working directory',

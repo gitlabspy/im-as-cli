@@ -379,6 +379,154 @@ describe('CodexProvider', () => {
     }
   });
 
+  it('passes effort as Codex modelReasoningEffort', async () => {
+    const { CodexProvider } = await import('../codex-provider.js');
+    const { PendingPermissions } = await import('../permission-gateway.js');
+    const provider = new CodexProvider(new PendingPermissions());
+
+    let capturedStartOptions: Record<string, unknown> | undefined;
+    const mockThread = {
+      runStreamed: () => ({
+        events: (async function* () {
+          yield { type: 'turn.completed', usage: { input_tokens: 1, output_tokens: 1, cached_input_tokens: 0 } };
+        })(),
+      }),
+    };
+    (provider as any).sdk = { Codex: class { constructor() {} } };
+    (provider as any).codex = {
+      startThread: (opts: Record<string, unknown>) => {
+        capturedStartOptions = opts;
+        return mockThread;
+      },
+    };
+
+    const stream = provider.streamChat({
+      prompt: 'search helper call',
+      sessionId: 'effort-session',
+      effort: 'medium',
+    });
+    await collectStream(stream);
+
+    assert.equal(capturedStartOptions?.modelReasoningEffort, 'medium');
+  });
+
+  it('does not reuse or cache Codex thread ids for ephemeral calls', async () => {
+    const { CodexProvider } = await import('../codex-provider.js');
+    const { PendingPermissions } = await import('../permission-gateway.js');
+    const provider = new CodexProvider(new PendingPermissions());
+
+    let resumeCalls = 0;
+    let startCalls = 0;
+    const mockThread = {
+      runStreamed: () => ({
+        events: (async function* () {
+          yield { type: 'thread.started', thread_id: 'ephemeral-thread-id' };
+          yield { type: 'turn.completed', usage: { input_tokens: 1, output_tokens: 1, cached_input_tokens: 0 } };
+        })(),
+      }),
+    };
+
+    (provider as any).threadIds.set('ephemeral-session', 'cached-thread-id');
+    (provider as any).sdk = { Codex: class { constructor() {} } };
+    (provider as any).codex = {
+      resumeThread: () => {
+        resumeCalls += 1;
+        return mockThread;
+      },
+      startThread: () => {
+        startCalls += 1;
+        return mockThread;
+      },
+    };
+
+    const stream = provider.streamChat({
+      prompt: 'one-shot helper',
+      sessionId: 'ephemeral-session',
+      sdkSessionId: 'persisted-thread-id',
+      ephemeral: true,
+    });
+    const chunks = await collectStream(stream);
+    const events = parseSSEChunks(chunks);
+    const resultEvent = events.find(e => e.type === 'result');
+
+    assert.equal(resumeCalls, 0, 'Ephemeral calls must not resume stored thread ids');
+    assert.equal(startCalls, 1, 'Ephemeral calls should start a fresh thread');
+    assert.equal((provider as any).threadIds.get('ephemeral-session'), 'cached-thread-id');
+    assert.ok(resultEvent, 'Ephemeral call should still emit a result');
+  });
+
+  it('finishes the stream when Codex emits task_complete without a turn.completed event', async () => {
+    const { CodexProvider } = await import('../codex-provider.js');
+    const { PendingPermissions } = await import('../permission-gateway.js');
+    const provider = new CodexProvider(new PendingPermissions());
+
+    const upstreamEvents = [
+      { type: 'thread.started', thread_id: 'codex-thread-task-complete' },
+      { type: 'item.completed', item: { type: 'agent_message', id: 'msg-1', text: 'final answer' } },
+      { type: 'event_msg', payload: { type: 'task_complete', last_agent_message: 'final answer' } },
+    ];
+    let pendingResolve: ((result: IteratorResult<unknown>) => void) | null = null;
+    const hangingIterator = {
+      index: 0,
+      closed: false,
+      returned: false,
+      [Symbol.asyncIterator]() { return this; },
+      next(): Promise<IteratorResult<unknown>> {
+        if (this.index < upstreamEvents.length) {
+          return Promise.resolve({ value: upstreamEvents[this.index++], done: false });
+        }
+        if (this.closed) {
+          return Promise.resolve({ value: undefined, done: true });
+        }
+        return new Promise(resolve => { pendingResolve = resolve; });
+      },
+      return(): Promise<IteratorResult<unknown>> {
+        this.returned = true;
+        this.close();
+        return Promise.resolve({ value: undefined, done: true });
+      },
+      close(): void {
+        this.closed = true;
+        if (pendingResolve) {
+          pendingResolve({ value: undefined, done: true });
+          pendingResolve = null;
+        }
+      },
+    };
+
+    const mockThread = {
+      runStreamed: () => ({ events: hangingIterator }),
+    };
+    (provider as any).sdk = { Codex: class { constructor() {} } };
+    (provider as any).codex = {
+      startThread: () => mockThread,
+    };
+
+    const stream = provider.streamChat({
+      prompt: 'complete without turn.completed',
+      sessionId: 'task-complete-session',
+    });
+
+    const timeout = Symbol('timeout');
+    const collectPromise = collectStream(stream);
+    try {
+      const chunks = await Promise.race([
+        collectPromise,
+        new Promise<typeof timeout>(resolve => setTimeout(resolve, 250, timeout)),
+      ]);
+
+      assert.notEqual(chunks, timeout, 'task_complete should close the stream promptly');
+      const events = parseSSEChunks(chunks as string[]);
+      assert.equal(events.filter(e => e.type === 'text').length, 1);
+      assert.equal(events.find(e => e.type === 'text')?.data, 'final answer');
+      assert.ok(events.find(e => e.type === 'result'), 'task_complete should emit a result event');
+      assert.equal(hangingIterator.returned, true, 'provider should stop reading the hung upstream stream');
+    } finally {
+      hangingIterator.close();
+      await collectPromise.catch(() => []);
+    }
+  });
+
   it('passes skipGitRepoCheck only when CTI_CODEX_SKIP_GIT_REPO_CHECK=true', async () => {
     const old = process.env.CTI_CODEX_SKIP_GIT_REPO_CHECK;
     process.env.CTI_CODEX_SKIP_GIT_REPO_CHECK = 'true';

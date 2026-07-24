@@ -10,7 +10,7 @@
 import { describe, it, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { initBridgeContext } from '../../lib/bridge/context';
-import { handlePermissionCallback } from '../../lib/bridge/permission-broker';
+import { forwardPermissionRequest, handlePermissionCallback } from '../../lib/bridge/permission-broker';
 import type { BridgeStore, PermissionGateway, PermissionResolution } from '../../lib/bridge/host';
 
 // ── Mock Store ──────────────────────────────────────────────
@@ -44,7 +44,16 @@ function createMockStore() {
     insertDedup: () => {},
     cleanupExpiredDedup: () => {},
     insertOutboundRef: () => {},
-    insertPermissionLink: () => {},
+    insertPermissionLink: (link: { permissionRequestId: string; chatId: string; messageId: string; suggestions: string; kind?: string; choices?: string }) => {
+      links.set(link.permissionRequestId, {
+        chatId: link.chatId,
+        messageId: link.messageId,
+        resolved: false,
+        suggestions: link.suggestions,
+        ...(link.kind ? { kind: link.kind } : {}),
+        ...(link.choices ? { choices: link.choices } : {}),
+      } as any);
+    },
     getPermissionLink: (id: string) => {
       return links.get(id) ?? null;
     },
@@ -200,6 +209,153 @@ describe('permission-broker', () => {
     assert.ok(result);
     assert.equal(gateway.resolved[0].resolution.behavior, 'allow');
     assert.ok((gateway.resolved[0].resolution as any).updatedPermissions);
+  });
+
+  it('resolves an AskUserQuestion choice with the selected label as the answer', async () => {
+    store.links.set('q-1', {
+      chatId: '123',
+      messageId: 'msg-q1',
+      resolved: false,
+      suggestions: '',
+      kind: 'question',
+      choices: JSON.stringify([
+        { index: 1, label: 'Use PostgreSQL' },
+        { index: 2, label: 'Use SQLite' },
+      ]),
+    } as any);
+
+    const result = await handlePermissionCallback('perm:choice:2:q-1', '123');
+    assert.ok(result);
+    assert.equal(gateway.resolved.length, 1);
+    assert.equal(gateway.resolved[0].id, 'q-1');
+    assert.equal(gateway.resolved[0].resolution.behavior, 'deny');
+    assert.equal(gateway.resolved[0].resolution.message, 'User selected: Use SQLite');
+  });
+
+  it('rejects an out-of-range choice index without resolving', async () => {
+    store.links.set('q-2', {
+      chatId: '123',
+      messageId: 'msg-q2',
+      resolved: false,
+      suggestions: '',
+      kind: 'question',
+      choices: JSON.stringify([{ index: 1, label: 'Only option' }]),
+    } as any);
+
+    const result = await handlePermissionCallback('perm:choice:5:q-2', '123');
+    assert.equal(result, false);
+    assert.equal(gateway.resolved.length, 0);
+    // The link must stay unresolved so the user can retry.
+    assert.equal(store.links.get('q-2')!.resolved, false);
+  });
+
+  it('acknowledges choice_other without resolving the pending question', async () => {
+    store.links.set('q-3', {
+      chatId: '123',
+      messageId: 'msg-q3',
+      resolved: false,
+      suggestions: '',
+      kind: 'question',
+      choices: JSON.stringify([{ index: 1, label: 'A' }, { index: 2, label: 'B' }]),
+    } as any);
+
+    const result = await handlePermissionCallback('perm:choice_other:q-3', '123');
+    assert.ok(result);
+    // No resolution yet — the question stays open for the user's free-form text.
+    assert.equal(gateway.resolved.length, 0);
+    assert.equal(store.links.get('q-3')!.resolved, false);
+  });
+});
+
+describe('permission-broker forwardPermissionRequest (AskUserQuestion)', () => {
+  let store: MockStore;
+  let gateway: MockGateway;
+
+  beforeEach(() => {
+    store = createMockStore();
+    gateway = createMockGateway();
+    setupContext(store, gateway);
+  });
+
+  it('renders an AskUserQuestion as a Feishu option-button card and stores choices', async () => {
+    const cards: Array<{ cardJson: string; replyToMessageId?: string }> = [];
+    const adapter = {
+      channelType: 'feishu',
+      send: async () => ({ ok: true, messageId: 'sent-1' }),
+      sendInteractiveCard: async (_address: unknown, cardJson: string, replyToMessageId?: string) => {
+        cards.push({ cardJson, replyToMessageId });
+        return { ok: true, messageId: 'q-card-1' };
+      },
+    } as any;
+
+    await forwardPermissionRequest(
+      adapter,
+      { channelType: 'feishu', chatId: 'chat-1' },
+      'q-perm-1',
+      'AskUserQuestion',
+      { questions: [{ question: 'Which database?', options: [{ label: 'PostgreSQL' }, { label: 'SQLite' }] }] },
+      'session-1',
+      [],
+      'msg-1',
+      {
+        kind: 'question',
+        questionText: 'Which database?',
+        choices: [
+          { index: 1, label: 'PostgreSQL' },
+          { index: 2, label: 'SQLite' },
+        ],
+      },
+    );
+
+    assert.equal(cards.length, 1);
+    assert.equal(cards[0].replyToMessageId, 'msg-1');
+    assert.match(cards[0].cardJson, /Which database\?/);
+    assert.match(cards[0].cardJson, /perm:choice:1:q-perm-1/);
+    assert.match(cards[0].cardJson, /perm:choice:2:q-perm-1/);
+    assert.match(cards[0].cardJson, /perm:choice_other:q-perm-1/);
+    // 其他（自定义回复）custom-reply button present
+    assert.match(cards[0].cardJson, /自定义回复/);
+
+    // Link stored with kind=question and serialized choices for later callbacks.
+    const link = store.links.get('q-perm-1') as any;
+    assert.ok(link);
+    assert.equal(link.kind, 'question');
+    assert.match(link.choices, /PostgreSQL/);
+  });
+
+  it('renders an AskUserQuestion as numbered text on QQ/WeChat (no buttons)', async () => {
+    const sent: Array<{ text: string }> = [];
+    const adapter = {
+      channelType: 'qq',
+      send: async (msg: { text: string }) => {
+        sent.push({ text: msg.text });
+        return { ok: true, messageId: 'qq-1' };
+      },
+    } as any;
+
+    await forwardPermissionRequest(
+      adapter,
+      { channelType: 'qq', chatId: 'chat-1' },
+      'q-perm-2',
+      'AskUserQuestion',
+      {},
+      'session-1',
+      [],
+      'msg-1',
+      {
+        kind: 'question',
+        questionText: 'Pick one',
+        choices: [
+          { index: 1, label: 'Alpha' },
+          { index: 2, label: 'Beta' },
+        ],
+      },
+    );
+
+    assert.equal(sent.length, 1);
+    assert.match(sent[0].text, /Pick one/);
+    assert.match(sent[0].text, /1 - Alpha/);
+    assert.match(sent[0].text, /2 - Beta/);
   });
 });
 

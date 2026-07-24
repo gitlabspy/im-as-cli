@@ -549,6 +549,8 @@ export class JsonFileStore implements BridgeStore {
       messageId: link.messageId,
       resolved: false,
       suggestions: link.suggestions,
+      ...(link.kind ? { kind: link.kind } : {}),
+      ...(link.choices ? { choices: link.choices } : {}),
     };
     this.permissionLinks.set(link.permissionRequestId, record);
     this.persistPermissions();

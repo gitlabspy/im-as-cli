@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
-import { listNativeSessionTabs } from '../../lib/bridge/native-session-index';
+import { listBackendSessionSummaries, listNativeSessionTabs } from '../../lib/bridge/native-session-index';
 
 const tempRoots: string[] = [];
 
@@ -109,5 +109,113 @@ describe('native-session-index', () => {
     assert.equal(tabs[0].workingDirectory, 'C:\\codex');
     assert.equal(tabs[0].lastUserQuestion, `${'u'.repeat(19)}…`);
     assert.equal(tabs[0].lastAgentOutput, `${'a'.repeat(19)}…`);
+  });
+
+  it('sorts by chat activity instead of touched jsonl mtime', () => {
+    const root = makeTempRoot();
+    const claudeProjectsDir = path.join(root, 'claude-projects');
+    const codexSessionsDir = path.join(root, 'codex-sessions');
+
+    writeJsonl(path.join(codexSessionsDir, 'old-chat-touched.jsonl'), [
+      {
+        timestamp: '2026-05-01T00:00:00.000Z',
+        type: 'response_item',
+        payload: { type: 'message', role: 'user', content: 'old but touched' },
+      },
+    ], new Date('2026-06-05T00:00:00.000Z'));
+
+    writeJsonl(path.join(codexSessionsDir, 'new-chat.jsonl'), [
+      {
+        timestamp: '2026-06-01T00:00:00.000Z',
+        type: 'response_item',
+        payload: { type: 'message', role: 'user', content: 'newer chat' },
+      },
+    ], new Date('2026-06-01T00:00:00.000Z'));
+
+    const tabs = listNativeSessionTabs({
+      backend: 'codex',
+      limit: 2,
+      roots: { claudeProjectsDir, codexSessionsDir },
+    });
+
+    assert.deepEqual(tabs.map((tab) => tab.nativeSessionId), ['new-chat', 'old-chat-touched']);
+  });
+
+  it('does not use newer non-chat timestamps as activityAt', () => {
+    const root = makeTempRoot();
+    const claudeProjectsDir = path.join(root, 'claude-projects');
+    const codexSessionsDir = path.join(root, 'codex-sessions');
+
+    writeJsonl(path.join(codexSessionsDir, 'metadata-newer.jsonl'), [
+      {
+        timestamp: '2026-05-01T00:00:00.000Z',
+        type: 'response_item',
+        payload: { type: 'message', role: 'user', content: 'older actual chat' },
+      },
+      {
+        timestamp: '2026-06-05T00:00:00.000Z',
+        type: 'session_meta',
+        payload: { id: 'metadata-newer', cwd: 'C:\\metadata' },
+      },
+    ], new Date('2026-06-05T00:00:00.000Z'));
+
+    writeJsonl(path.join(codexSessionsDir, 'chat-newer.jsonl'), [
+      {
+        timestamp: '2026-06-01T00:00:00.000Z',
+        type: 'response_item',
+        payload: { type: 'agent_message', role: 'assistant', content: 'newer actual chat' },
+      },
+    ], new Date('2026-06-01T00:00:00.000Z'));
+
+    const summaries = listBackendSessionSummaries({
+      backend: 'codex',
+      limit: 2,
+      roots: { claudeProjectsDir, codexSessionsDir },
+    });
+
+    assert.deepEqual(summaries.map((summary) => summary.nativeSessionId), ['chat-newer', 'metadata-newer']);
+    assert.equal(summaries[1].activityAt, '2026-05-01T00:00:00.000Z');
+  });
+
+  it('filters search helper sessions by default and can include them explicitly', () => {
+    const root = makeTempRoot();
+    const claudeProjectsDir = path.join(root, 'claude-projects');
+    const codexSessionsDir = path.join(root, 'codex-sessions');
+
+    writeJsonl(path.join(codexSessionsDir, 'normal.jsonl'), [
+      {
+        timestamp: '2026-06-01T00:00:00.000Z',
+        type: 'response_item',
+        payload: { type: 'message', role: 'user', content: 'normal user task' },
+      },
+    ], new Date('2026-06-01T00:00:00.000Z'));
+
+    writeJsonl(path.join(codexSessionsDir, 'helper.jsonl'), [
+      {
+        timestamp: '2026-06-02T00:00:00.000Z',
+        type: 'response_item',
+        payload: {
+          type: 'message',
+          role: 'user',
+          content: 'You are selecting the single most relevant existing coding-agent session for a user search query.',
+        },
+      },
+    ], new Date('2026-06-02T00:00:00.000Z'));
+
+    const defaultSummaries = listBackendSessionSummaries({
+      backend: 'codex',
+      limit: 10,
+      roots: { claudeProjectsDir, codexSessionsDir },
+    });
+    const allSummaries = listBackendSessionSummaries({
+      backend: 'codex',
+      includeHelperSessions: true,
+      limit: 10,
+      roots: { claudeProjectsDir, codexSessionsDir },
+    });
+
+    assert.deepEqual(defaultSummaries.map((summary) => summary.nativeSessionId), ['normal']);
+    assert.deepEqual(allSummaries.map((summary) => summary.nativeSessionId), ['helper', 'normal']);
+    assert.equal(allSummaries[0].isHelperSession, true);
   });
 });

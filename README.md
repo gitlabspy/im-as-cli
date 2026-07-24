@@ -6,8 +6,6 @@ Telegram, Discord, Feishu/Lark, QQ, and WeChat.
 This repository is the new open-source root for the project. It is not intended
 to inherit earlier repository history or install instructions.
 
-Current best practise: Lark + codex.
-
 ## Requirements
 
 - Node.js 20 or newer

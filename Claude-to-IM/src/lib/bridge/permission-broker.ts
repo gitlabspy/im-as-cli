@@ -12,16 +12,24 @@
 import type { PermissionUpdate } from '@anthropic-ai/claude-agent-sdk';
 import type { ChannelAddress, OutboundMessage } from './types.js';
 import type { BaseChannelAdapter } from './channel-adapter.js';
+import type { PermissionChoice } from './conversation-engine.js';
 import { deliver } from './delivery-layer.js';
 import { getBridgeContext } from './context.js';
 import { escapeHtml } from './adapters/telegram-utils.js';
 import { formatToolInput } from './markdown/tool-input.js';
+import { buildQuestionCard } from './markdown/feishu.js';
 
 /**
  * Dedup recent permission forwards to prevent duplicate cards.
  * Key: permissionRequestId, value: timestamp. Entries expire after 30s.
  */
 const recentPermissionForwards = new Map<string, number>();
+
+export interface ForwardQuestionOptions {
+  kind: 'question';
+  questionText: string;
+  choices: PermissionChoice[];
+}
 
 /**
  * Forward a permission request to an IM channel as an interactive message.
@@ -35,6 +43,7 @@ export async function forwardPermissionRequest(
   sessionId?: string,
   suggestions?: unknown[],
   replyToMessageId?: string,
+  question?: ForwardQuestionOptions,
 ): Promise<void> {
   const { store } = getBridgeContext();
 
@@ -48,6 +57,19 @@ export async function forwardPermissionRequest(
   // Clean up old entries
   for (const [id, ts] of recentPermissionForwards) {
     if (now - ts > 30_000) recentPermissionForwards.delete(id);
+  }
+
+  // ── AskUserQuestion (single-select) → option-button card ──
+  if (question && question.choices.length > 0) {
+    await forwardQuestionRequest(
+      adapter,
+      address,
+      permissionRequestId,
+      question,
+      sessionId,
+      replyToMessageId,
+    );
+    return;
   }
 
   console.log(`[permission-broker] Forwarding permission request: ${permissionRequestId} tool=${toolName} channel=${adapter.channelType}`);
@@ -132,6 +154,91 @@ export async function forwardPermissionRequest(
 }
 
 /**
+ * Render an AskUserQuestion as an option-button card (button channels) or a
+ * numbered text prompt (text channels). The question kind + choices are stored
+ * on the permission link so callbacks/numeric replies can translate the chosen
+ * index back into the option label.
+ */
+async function forwardQuestionRequest(
+  adapter: BaseChannelAdapter,
+  address: ChannelAddress,
+  permissionRequestId: string,
+  question: ForwardQuestionOptions,
+  sessionId?: string,
+  replyToMessageId?: string,
+): Promise<void> {
+  const { store } = getBridgeContext();
+  const choicesJson = JSON.stringify(question.choices);
+  let result: import('./types.js').SendResult;
+
+  if (adapter.channelType === 'feishu' && adapter.sendInteractiveCard) {
+    const cardJson = buildQuestionCard(
+      question.questionText,
+      question.choices,
+      permissionRequestId,
+      address.chatId,
+    );
+    result = await adapter.sendInteractiveCard(address, cardJson, replyToMessageId);
+  } else if (adapter.channelType === 'qq' || adapter.channelType === 'weixin') {
+    const lines = [
+      question.questionText,
+      '',
+      ...question.choices.map((choice) => `${choice.index} - ${choice.label}${choice.description ? `（${choice.description}）` : ''}`),
+      '',
+      '回复编号选择，或直接发送自定义内容给 agent。',
+    ];
+    result = await deliver(adapter, {
+      address,
+      text: lines.join('\n'),
+      parseMode: 'plain',
+      replyToMessageId,
+    }, { sessionId });
+  } else {
+    // Telegram / Discord / others: HTML text + inline option buttons.
+    const text = [
+      `<b>需要你的选择</b>`,
+      ``,
+      escapeHtml(question.questionText),
+      ``,
+      ...question.choices.map((choice) =>
+        `${choice.index}. ${escapeHtml(choice.label)}${choice.description ? ` — ${escapeHtml(choice.description)}` : ''}`),
+    ].join('\n');
+    const optionButtons = question.choices.map((choice) => ({
+      text: `${choice.index}. ${choice.label}`,
+      callbackData: `perm:choice:${choice.index}:${permissionRequestId}`,
+    }));
+    // Chunk into rows of up to 3, plus the custom-reply button on its own row.
+    const rows: Array<Array<{ text: string; callbackData: string }>> = [];
+    for (let start = 0; start < optionButtons.length; start += 3) {
+      rows.push(optionButtons.slice(start, start + 3));
+    }
+    rows.push([{ text: '其他（自定义回复）', callbackData: `perm:choice_other:${permissionRequestId}` }]);
+    result = await deliver(adapter, {
+      address,
+      text,
+      parseMode: 'HTML',
+      inlineButtons: rows,
+      replyToMessageId,
+    }, { sessionId });
+  }
+
+  if (result.ok && result.messageId) {
+    try {
+      store.insertPermissionLink({
+        permissionRequestId,
+        channelType: adapter.channelType,
+        chatId: address.chatId,
+        messageId: result.messageId,
+        toolName: 'AskUserQuestion',
+        suggestions: '',
+        kind: 'question',
+        choices: choicesJson,
+      });
+    } catch { /* best effort */ }
+  }
+}
+
+/**
  * Handle a permission callback from an inline button press.
  * Validates that the callback came from the same chat AND same message that
  * received the permission request, prevents duplicate resolution via atomic
@@ -148,11 +255,21 @@ export async function handlePermissionCallback(
   const { store, permissions } = getBridgeContext();
 
   // Parse callback data: perm:action:permId
+  // Special form for question options: perm:choice:<index>:permId
   const parts = callbackData.split(':');
   if (parts.length < 3 || parts[0] !== 'perm') return false;
 
   const action = parts[1];
-  const permissionRequestId = parts.slice(2).join(':'); // permId might contain colons
+  let choiceIndex: number | null = null;
+  let permissionRequestId: string;
+  if (action === 'choice') {
+    if (parts.length < 4) return false;
+    choiceIndex = Number.parseInt(parts[2], 10);
+    if (!Number.isInteger(choiceIndex)) return false;
+    permissionRequestId = parts.slice(3).join(':');
+  } else {
+    permissionRequestId = parts.slice(2).join(':'); // permId might contain colons
+  }
 
   // Look up the permission link to validate origin and check dedup
   const link = store.getPermissionLink(permissionRequestId);
@@ -171,6 +288,24 @@ export async function handlePermissionCallback(
   if (callbackMessageId && link.messageId !== callbackMessageId) {
     console.warn(`[permission-broker] Message ID mismatch: expected ${link.messageId}, got ${callbackMessageId}`);
     return false;
+  }
+
+  // 'choice_other' is acknowledged but does NOT resolve the question: the user
+  // will follow up with free-form text that the bridge feeds back to the agent.
+  // Leaving the link unresolved keeps the pending permission alive for that text.
+  if (action === 'choice_other') {
+    return link.resolved ? false : true;
+  }
+
+  // Validate the choice index BEFORE claiming the link, so an out-of-range
+  // selection leaves the question open for the user to retry.
+  let choiceLabel: string | null = null;
+  if (action === 'choice') {
+    choiceLabel = lookupChoiceLabel(link.choices, choiceIndex);
+    if (!choiceLabel) {
+      console.warn(`[permission-broker] Choice index ${choiceIndex} out of range for ${permissionRequestId}`);
+      return false;
+    }
   }
 
   // Dedup: reject if already resolved (fast path before expensive resolution)
@@ -226,9 +361,32 @@ export async function handlePermissionCallback(
       });
       break;
 
+    case 'choice': {
+      // AskUserQuestion option selection. The label was validated before the
+      // link was claimed; resolve with it as the answer message so the skill's
+      // canUseTool feeds it back to the model.
+      resolved = await permissions.resolvePendingPermission(permissionRequestId, {
+        behavior: 'deny',
+        message: `User selected: ${choiceLabel}`,
+      });
+      break;
+    }
+
     default:
       return false;
   }
 
   return resolved;
+}
+
+/** Resolve a 1-based choice index to its label from serialized choices JSON. */
+function lookupChoiceLabel(choicesJson: string | undefined, index: number | null): string | null {
+  if (!choicesJson || index == null) return null;
+  try {
+    const choices = JSON.parse(choicesJson) as Array<{ index: number; label: string }>;
+    const match = choices.find((choice) => choice.index === index);
+    return match?.label ?? null;
+  } catch {
+    return null;
+  }
 }

@@ -19,11 +19,23 @@ import type {
 import { getBridgeContext } from './context.js';
 import crypto from 'crypto';
 
+export interface PermissionChoice {
+  index: number;
+  label: string;
+  description?: string;
+}
+
 export interface PermissionRequestInfo {
   permissionRequestId: string;
   toolName: string;
   toolInput: Record<string, unknown>;
   suggestions?: unknown[];
+  /** Discriminator: 'permission' (default) or 'question' (AskUserQuestion single-select). */
+  kind?: 'permission' | 'question';
+  /** For kind='question': the question text to show. */
+  questionText?: string;
+  /** For kind='question': selectable options rendered as buttons. */
+  choices?: PermissionChoice[];
 }
 
 /**
@@ -346,6 +358,9 @@ async function consumeStream(
                 toolName: permData.toolName,
                 toolInput: permData.toolInput,
                 suggestions: permData.suggestions,
+                kind: permData.kind === 'question' ? 'question' : 'permission',
+                questionText: permData.questionText,
+                choices: Array.isArray(permData.choices) ? permData.choices : undefined,
               };
               permissionRequests.push(perm);
               // Forward immediately — the stream blocks until the permission is

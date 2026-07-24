@@ -112,6 +112,10 @@ export interface PermissionLinkInput {
   messageId: string;
   toolName: string;
   suggestions: string;
+  /** Discriminator: 'permission' (default) or 'question'. */
+  kind?: 'permission' | 'question';
+  /** For kind='question': JSON-serialized choices [{index,label,description?}]. */
+  choices?: string;
 }
 
 /** Stored permission link record. */
@@ -121,6 +125,10 @@ export interface PermissionLinkRecord {
   messageId: string;
   resolved: boolean;
   suggestions: string;
+  /** Discriminator: 'permission' (default) or 'question'. */
+  kind?: 'permission' | 'question';
+  /** For kind='question': JSON-serialized choices [{index,label,description?}]. */
+  choices?: string;
 }
 
 /** Input for inserting an outbound reference. */
@@ -218,11 +226,15 @@ export interface BridgeStore {
 // ── Host Interface: LLM Provider ─────────────────────────────
 
 /** Parameters for starting an LLM stream. */
+export type ReasoningEffort = 'low' | 'medium' | 'high';
+
 export interface StreamChatParams {
   prompt: string;
   sessionId: string;
   sdkSessionId?: string;
   model?: string;
+  /** Backend reasoning effort hint for one-off helper calls and compatible providers. */
+  effort?: ReasoningEffort;
   systemPrompt?: string;
   workingDirectory?: string;
   abortController?: AbortController;

@@ -360,6 +360,46 @@ const SUPPORTED_IMAGE_TYPES = new Set<string>([
  * iterable that yields a single SDKUserMessage with multi-modal content
  * (image blocks + text). Otherwise returns the plain text string.
  */
+/**
+ * Extract a single-select AskUserQuestion into a flat question + option list.
+ *
+ * AskUserQuestion input shape: { questions: [{ question, header, options:
+ * [{ label, description }], multiSelect }] }. We only intercept the FIRST
+ * single-select question with 2+ options; multiSelect or malformed input
+ * returns null so the caller falls back to the normal permission path.
+ */
+export function extractSingleSelectQuestion(
+  input: Record<string, unknown>,
+): { questionText: string; choices: Array<{ index: number; label: string; description?: string }> } | null {
+  const questions = (input as { questions?: unknown }).questions;
+  if (!Array.isArray(questions) || questions.length === 0) return null;
+  const first = questions[0];
+  if (!first || typeof first !== 'object') return null;
+  const q = first as { question?: unknown; header?: unknown; options?: unknown; multiSelect?: unknown };
+  if (q.multiSelect === true) return null;
+  if (!Array.isArray(q.options) || q.options.length < 2) return null;
+
+  const choices: Array<{ index: number; label: string; description?: string }> = [];
+  for (const option of q.options) {
+    if (!option || typeof option !== 'object') continue;
+    const o = option as { label?: unknown; description?: unknown };
+    const label = typeof o.label === 'string' ? o.label.trim() : '';
+    if (!label) continue;
+    choices.push({
+      index: choices.length + 1,
+      label,
+      description: typeof o.description === 'string' ? o.description : undefined,
+    });
+  }
+  if (choices.length < 2) return null;
+
+  const header = typeof q.header === 'string' ? q.header.trim() : '';
+  const questionText = typeof q.question === 'string' && q.question.trim()
+    ? q.question.trim()
+    : header || 'Please choose an option';
+  return { questionText, choices };
+}
+
 function buildPrompt(
   text: string,
   files?: FileAttachment[],
@@ -467,11 +507,12 @@ export class SDKLLMProvider implements LLMProvider {
             const queryOptions: Record<string, unknown> = {
               cwd: params.workingDirectory,
               model,
+              effort: params.effort,
               resume: params.ephemeral ? undefined : params.sdkSessionId || undefined,
               abortController: params.abortController,
               permissionMode: (params.permissionMode as 'default' | 'acceptEdits' | 'plan') || undefined,
               includePartialMessages: true,
-              ...(params.ephemeral ? { tools: [] } : {}),
+              ...(params.ephemeral ? { tools: [], persistSession: false } : {}),
               settingSources: [...DEFAULT_SETTING_SOURCES],
               env: cleanEnv,
               stderr: (data: string) => {
@@ -489,6 +530,31 @@ export class SDKLLMProvider implements LLMProvider {
                   // interactive permission UI, e.g. Feishu WebSocket mode)
                   if (autoApprove) {
                     return { behavior: 'allow' as const, updatedInput: input };
+                  }
+
+                  // AskUserQuestion (single-select): render real option buttons
+                  // instead of an Allow/Deny permission card. The selected option
+                  // label is fed back to the model as the answer.
+                  const question = extractSingleSelectQuestion(input);
+                  if (toolName === 'AskUserQuestion' && question) {
+                    controller.enqueue(
+                      sseEvent('permission_request', {
+                        permissionRequestId: opts.toolUseID,
+                        toolName,
+                        toolInput: input,
+                        suggestions: opts.suggestions || [],
+                        kind: 'question',
+                        questionText: question.questionText,
+                        choices: question.choices,
+                      }),
+                    );
+                    const answer = await pendingPerms.waitFor(opts.toolUseID);
+                    // Selected option (or custom text) comes back as the deny
+                    // message; surface it to the model so it can continue.
+                    return {
+                      behavior: 'deny' as const,
+                      message: answer.message || 'User did not choose an option',
+                    };
                   }
 
                   // Emit permission_request SSE event for the bridge

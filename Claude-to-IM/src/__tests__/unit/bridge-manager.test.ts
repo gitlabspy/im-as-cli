@@ -8,15 +8,34 @@
  * - Auto-start idempotency
  */
 
-import { describe, it, beforeEach } from 'node:test';
+import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { initBridgeContext } from '../../lib/bridge/context';
+import { resetDeliveryRateLimiterForTests } from '../../lib/bridge/delivery-layer';
 import type { BridgeStore, BridgeSession, LifecycleHooks, LLMProvider, StreamChatParams } from '../../lib/bridge/host';
 import type { BaseChannelAdapter } from '../../lib/bridge/channel-adapter';
 import type { BridgeSessionTab, ChannelBinding, OutboundMessage, SendResult } from '../../lib/bridge/types';
+
+function resetBridgeTestState(): void {
+  const state = (globalThis as Record<string, any>)['__bridge_manager__'];
+  if (state) {
+    for (const abort of state.loopAborts?.values?.() ?? []) {
+      try { abort.abort(); } catch { /* ignore */ }
+    }
+    for (const abort of state.activeTasks?.values?.() ?? []) {
+      try { abort.abort(); } catch { /* ignore */ }
+    }
+    state.tabListings?.clear?.();
+    state.searchResults?.clear?.();
+    state.sessionLocks?.clear?.();
+  }
+  delete (globalThis as Record<string, unknown>)['__bridge_manager__'];
+  delete (globalThis as Record<string, unknown>)['__bridge_context__'];
+  resetDeliveryRateLimiterForTests();
+}
 
 // ── Test the session lock mechanism directly ────────────────
 // We test the processWithSessionLock pattern by extracting its logic.
@@ -116,10 +135,9 @@ describe('bridge-manager session locks', () => {
 
 describe('bridge-manager lifecycle', () => {
   beforeEach(() => {
-    // Clear bridge manager state
-    delete (globalThis as Record<string, unknown>)['__bridge_manager__'];
-    delete (globalThis as Record<string, unknown>)['__bridge_context__'];
+    resetBridgeTestState();
   });
+  afterEach(resetBridgeTestState);
 
   it('getStatus returns not running when bridge has not started', async () => {
     const store = createMinimalStore({ remote_bridge_enabled: 'false' });
@@ -140,14 +158,14 @@ describe('bridge-manager lifecycle', () => {
 
 describe('bridge-manager commands — native session routing', () => {
   beforeEach(() => {
-    delete (globalThis as Record<string, unknown>)['__bridge_manager__'];
-    delete (globalThis as Record<string, unknown>)['__bridge_context__'];
+    resetBridgeTestState();
     const nativeRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'cti-bridge-native-empty-'));
     process.env.CTI_CLAUDE_PROJECTS_DIR = path.join(nativeRoot, 'claude-projects');
     process.env.CTI_CODEX_SESSIONS_DIR = path.join(nativeRoot, 'codex-sessions');
     fs.mkdirSync(process.env.CTI_CLAUDE_PROJECTS_DIR, { recursive: true });
     fs.mkdirSync(process.env.CTI_CODEX_SESSIONS_DIR, { recursive: true });
   });
+  afterEach(resetBridgeTestState);
 
   it('/status shows full bridge and native session ids', async () => {
     const nativeSessionId = '019e64a9-9be8-7823-a1e6-747e1fb7433b';
@@ -297,7 +315,13 @@ describe('bridge-manager commands — native session routing', () => {
   });
 
   it('/tabs sends a Feishu choice card when interactive cards are supported', async () => {
-    const { store } = createCommandStore();
+    const activeSessionId = '0372c636-4840-4160-bc52-0104d69e1378';
+    const { store } = createCommandStore({
+      codepilotSessionId: activeSessionId,
+      backendSessionIds: { codex: activeSessionId },
+      sessionTabs: [createSessionTab(activeSessionId, 'codex', '2026-06-01T00:00:00.000Z')],
+      activeSessionTabId: activeSessionId,
+    });
     initBridgeContext({
       store,
       llm: { streamChat: () => new ReadableStream() },
@@ -392,6 +416,9 @@ describe('bridge-manager commands — native session routing', () => {
     assert.equal(calls[0].sdkSessionId, undefined);
     assert.equal(calls[0].backendSdkSessionId, undefined);
     assert.equal(calls[0].sandboxLevel, 'ro');
+    assert.equal(calls[0].effort, 'medium');
+    assert.match(calls[0].prompt, /keywordEvidence/);
+    assert.match(calls[0].prompt, /similarityEvidence/);
     assert.equal(binding.codepilotSessionId, 'active-session');
   });
 
@@ -437,6 +464,57 @@ describe('bridge-manager commands — native session routing', () => {
     assert.equal(sent.length, 1);
     assert.match(sent[0].text, /Reason: 搜索代理匹配：cache cleanup matches/);
     assert.doesNotMatch(sent[0].text, /Last user question:/);
+  });
+
+  it('/search can return the current session and labels it as current', async () => {
+    const activeTab = createSessionTab('active-session', 'codex', new Date('2026-06-02T00:00:00.000Z').toISOString());
+    const { store, binding } = createCommandStore({
+      codepilotSessionId: 'active-session',
+      backendSessionIds: { codex: 'active-session' },
+      sessionTabs: [activeTab],
+      activeSessionTabId: 'active-session',
+    });
+    (store as BridgeStore).getMessages = (sessionId: string) => ({
+      messages: sessionId === 'active-session'
+        ? [
+            { role: 'user', content: 'Investigate the current session search behavior.' },
+            { role: 'assistant', content: 'Current session search behavior analysis.' },
+          ]
+        : [],
+    });
+
+    const calls: StreamChatParams[] = [];
+    initBridgeContext({
+      store,
+      llm: createSearchLlm(calls, () => [
+        { type: 'text', data: '{"index":1,"confidence":0.93,"reason":"current session matches"}' },
+      ]),
+      permissions: { resolvePendingPermission: () => false },
+      lifecycle: {},
+    });
+
+    const sent: OutboundMessage[] = [];
+    const cards: Array<{ cardJson: string; replyToMessageId?: string }> = [];
+    const adapter = createCommandAdapter(sent, {
+      sendInteractiveCard: async (_address, cardJson, replyToMessageId) => {
+        cards.push({ cardJson, replyToMessageId });
+        return { ok: true, messageId: 'search-current-card' };
+      },
+    });
+    const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+
+    await _testOnly.handleMessage(adapter, {
+      messageId: 'msg-search-current',
+      address: { channelType: 'feishu', chatId: 'chat-1' },
+      text: '/search current session search behavior',
+      timestamp: Date.now(),
+    });
+
+    assert.equal(sent.length, 0);
+    assert.equal(cards.length, 1);
+    assert.match(cards[0].cardJson, /active-session/);
+    assert.match(cards[0].cardJson, /current session/i);
+    assert.equal(binding.codepilotSessionId, 'active-session');
   });
 
   it('/search accepts a recent-session limit as the final numeric argument', async () => {
@@ -739,6 +817,81 @@ describe('bridge-manager commands — native session routing', () => {
     assert.match(cards[0], /Last user question: Can you investigate the invoice export timeout\?/);
   });
 
+  it('/search matches older native transcript text beyond latest snippets', async () => {
+    const nativeSessionId = '0beb3f1b-8757-4286-b3a4-4734694aa42b';
+    writeJsonl(path.join(process.env.CTI_CLAUDE_PROJECTS_DIR!, 'C--Users-hanbangliang', `${nativeSessionId}.jsonl`), [
+      {
+        timestamp: '2026-06-19T08:16:14.280Z',
+        type: 'user',
+        message: { role: 'user', content: [{ type: 'text', text: '查找一个 mixgrpo 调研的 Claude session' }] },
+        cwd: 'C:\\native',
+        sessionId: nativeSessionId,
+      },
+      {
+        timestamp: '2026-06-19T08:22:59.073Z',
+        type: 'assistant',
+        message: { role: 'assistant', content: [{ type: 'text', text: 'MixGRPO 调研报告已经整理完成。' }] },
+        cwd: 'C:\\native',
+        sessionId: nativeSessionId,
+      },
+      {
+        timestamp: '2026-06-19T09:54:52.916Z',
+        type: 'user',
+        message: { role: 'user', content: [{ type: 'text', text: '后续只检查 backend cwd 状态' }] },
+        cwd: 'C:\\native',
+        sessionId: nativeSessionId,
+      },
+      {
+        timestamp: '2026-06-19T09:55:52.916Z',
+        type: 'assistant',
+        message: { role: 'assistant', content: [{ type: 'text', text: '最近输出没有目标关键词。' }] },
+        cwd: 'C:\\native',
+        sessionId: nativeSessionId,
+      },
+    ]);
+
+    const activeTab = createSessionTab('active-claude-session', 'claudecode', '2026-06-19T10:00:00.000Z');
+    const { store } = createCommandStore({
+      codepilotSessionId: 'active-claude-session',
+      backend: 'claudecode',
+      backendSessionIds: { claudecode: 'active-claude-session' },
+      sessionTabs: [activeTab],
+      activeSessionTabId: 'active-claude-session',
+    });
+
+    const calls: StreamChatParams[] = [];
+    initBridgeContext({
+      store,
+      llm: createSearchLlm(calls, () => [{ type: 'error', data: 'agent unavailable' }]),
+      permissions: { resolvePendingPermission: () => false },
+      lifecycle: {},
+    });
+
+    const sent: OutboundMessage[] = [];
+    const cards: string[] = [];
+    const adapter = createCommandAdapter(sent, {
+      sendInteractiveCard: async (_address, cardJson) => {
+        cards.push(cardJson);
+        return { ok: true, messageId: 'search-card-1' };
+      },
+    });
+    const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+
+    await _testOnly.handleMessage(adapter, {
+      messageId: 'msg-search-native-transcript',
+      address: { channelType: 'feishu', chatId: 'chat-1' },
+      text: '/search mixgrpo 调研',
+      timestamp: Date.now(),
+    });
+
+    assert.equal(calls.length, 1);
+    assert.match(calls[0].prompt, /native transcript keyword matches/);
+    assert.equal(cards.length, 1);
+    assert.match(cards[0], new RegExp(nativeSessionId));
+    assert.match(cards[0], /本地关键词匹配/);
+    assert.match(cards[0], /mixgrpo/);
+  });
+
   it('invalidates the old /search result when retry finds no replacement', async () => {
     const now = Date.now();
     const activeTab = createSessionTab('active-session', 'codex', new Date(now).toISOString());
@@ -819,15 +972,17 @@ describe('bridge-manager commands — native session routing', () => {
       bufferedResponseText: '',
       bufferedErrorMessage: '',
       unread: false,
+      activityAt: new Date(now - minutesAgo * 60_000).toISOString(),
       createdAt: new Date(now - minutesAgo * 60_000).toISOString(),
       updatedAt: new Date(now - minutesAgo * 60_000).toISOString(),
     });
-    const { store, binding } = createCommandStore({
+    const { store, binding, sessions } = createCommandStore({
       codepilotSessionId: 'codex-active-session',
       backend: 'codex',
       backendSessionIds: { codex: 'codex-active-session' },
       sessionTabs: [
         tab('claude-newer-session', 'claudecode', 1),
+        tab('codex-active-session', 'codex', 1.5),
         tab('codex-newer-session', 'codex', 2),
         tab('codex-older-session', 'codex', 3),
         tab('claude-older-session', 'claudecode', 4),
@@ -928,6 +1083,250 @@ describe('bridge-manager commands — native session routing', () => {
     assert.doesNotMatch(cards[0].cardJson, /codex-global-third-session/);
   });
 
+  it('/tabs lists the 10 most recent chat-active native sessions with full native ids', async () => {
+    const nativeIds = Array.from({ length: 12 }, (_, index) =>
+      `019edeab-882e-7000-8000-${String(index + 1).padStart(12, '0')}`);
+    for (const [index, nativeId] of nativeIds.entries()) {
+      writeJsonl(path.join(process.env.CTI_CODEX_SESSIONS_DIR!, '2026', '06', `${nativeId}.jsonl`), [
+        {
+          timestamp: '2026-06-02T00:00:00.000Z',
+          type: 'session_meta',
+          payload: { id: nativeId, cwd: `C:\\native\\${index + 1}` },
+        },
+        {
+          timestamp: new Date(Date.UTC(2026, 5, 2, 0, 30 - index, 0)).toISOString(),
+          type: 'response_item',
+          payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text: `native chat ${index + 1}` }] },
+        },
+      ]);
+    }
+    writeJsonl(path.join(process.env.CTI_CODEX_SESSIONS_DIR!, '2026', '06', 'metadata-only.jsonl'), [
+      {
+        timestamp: '2026-06-03T00:00:00.000Z',
+        type: 'session_meta',
+        payload: { id: '019edeab-882e-7000-8000-metadataonly', cwd: 'C:\\native\\metadata' },
+      },
+    ]);
+
+    const { store } = createCommandStore({
+      codepilotSessionId: 'bridge-active-no-chat',
+      backend: 'codex',
+      backendSessionIds: { codex: 'bridge-active-no-chat' },
+      sessionTabs: [],
+      activeSessionTabId: 'bridge-active-no-chat',
+    });
+    initBridgeContext({
+      store,
+      llm: { streamChat: () => new ReadableStream() },
+      permissions: { resolvePendingPermission: () => false },
+      lifecycle: {},
+    });
+
+    const sent: OutboundMessage[] = [];
+    const cards: Array<{ cardJson: string }> = [];
+    const adapter = createCommandAdapter(sent, {
+      sendInteractiveCard: async (_address, cardJson) => {
+        cards.push({ cardJson });
+        return { ok: true, messageId: 'card-1' };
+      },
+    });
+    const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+
+    await _testOnly.handleMessage(adapter, {
+      messageId: 'msg-tabs-native-recent',
+      address: { channelType: 'feishu', chatId: 'chat-1' },
+      text: '/tabs',
+      timestamp: Date.now(),
+    });
+
+    assert.equal(sent.length, 0);
+    assert.equal(cards.length, 1);
+    const card = JSON.parse(cards[0].cardJson);
+    const content = card.body.elements[0].content as string;
+    assert.equal((content.match(/^\*\*\d+\./gm) ?? []).length, 10);
+    for (const nativeId of nativeIds.slice(0, 10)) {
+      assert.match(content, new RegExp(nativeId));
+    }
+    assert.doesNotMatch(content, new RegExp(nativeIds[10]));
+    assert.doesNotMatch(content, /metadataonly/);
+    assert.doesNotMatch(content, /native:/);
+    assert.doesNotMatch(content, /\.\.\./);
+    assert.match(content, /codex/);
+    assert.match(content, /C:\\native\\1/);
+    assert.match(content, /completed/);
+  });
+
+  it('/tabs Feishu card shows latest native user and agent snippets truncated to 20 chars', async () => {
+    writeJsonl(path.join(process.env.CTI_CODEX_SESSIONS_DIR!, '2026', '06', 'snippets.jsonl'), [
+      {
+        timestamp: '2026-06-02T00:00:00.000Z',
+        type: 'session_meta',
+        payload: { id: 'codex-native-snippet-session', cwd: 'C:\\native\\snippets' },
+      },
+      {
+        timestamp: '2026-06-02T00:01:00.000Z',
+        type: 'response_item',
+        payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text: '1234567890123456789012345' }] },
+      },
+      {
+        timestamp: '2026-06-02T00:02:00.000Z',
+        type: 'response_item',
+        payload: { type: 'agent_message', role: 'assistant', content: [{ type: 'output_text', text: 'abcdefghijklmnopqrstuvwxyz' }] },
+      },
+    ]);
+
+    const { store } = createCommandStore({
+      codepilotSessionId: 'bridge-active-no-chat',
+      backend: 'codex',
+      backendSessionIds: { codex: 'bridge-active-no-chat' },
+      sessionTabs: [],
+      activeSessionTabId: 'bridge-active-no-chat',
+    });
+    initBridgeContext({
+      store,
+      llm: { streamChat: () => new ReadableStream() },
+      permissions: { resolvePendingPermission: () => false },
+      lifecycle: {},
+    });
+
+    const sent: OutboundMessage[] = [];
+    const cards: Array<{ cardJson: string }> = [];
+    const adapter = createCommandAdapter(sent, {
+      sendInteractiveCard: async (_address, cardJson) => {
+        cards.push({ cardJson });
+        return { ok: true, messageId: 'card-1' };
+      },
+    });
+    const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+
+    await _testOnly.handleMessage(adapter, {
+      messageId: 'msg-tabs-snippets-card',
+      address: { channelType: 'feishu', chatId: 'chat-1' },
+      text: '/tabs',
+      timestamp: Date.now(),
+    });
+
+    assert.equal(sent.length, 0);
+    assert.equal(cards.length, 1);
+    const card = JSON.parse(cards[0].cardJson);
+    const content = card.body.elements[0].content as string;
+    assert.match(content, /user: 1234567890123456789…/);
+    assert.match(content, /agent: abcdefghijklmnopqrs…/);
+    assert.doesNotMatch(content, /12345678901234567890/);
+    assert.doesNotMatch(content, /abcdefghijklmnopqrst/);
+  });
+
+  it('/tabs text fallback shows latest stored user and agent snippets truncated to 20 chars', async () => {
+    const tab = createSessionTab('codex-chat-session', 'codex', '2026-06-02T00:00:00.000Z');
+    const { store } = createCommandStore({
+      codepilotSessionId: 'codex-chat-session',
+      backend: 'codex',
+      backendSessionIds: { codex: 'codex-chat-session' },
+      sessionTabs: [tab],
+      activeSessionTabId: 'codex-chat-session',
+    });
+    (store as BridgeStore).getMessages = (sessionId: string) => ({
+      messages: sessionId === 'codex-chat-session'
+        ? [
+            { role: 'user', content: 'old user message' },
+            { role: 'assistant', content: 'old agent message' },
+            { role: 'user', content: '1234567890123456789012345' },
+            { role: 'assistant', content: 'abcdefghijklmnopqrstuvwxyz' },
+          ]
+        : [],
+    });
+    initBridgeContext({
+      store,
+      llm: { streamChat: () => new ReadableStream() },
+      permissions: { resolvePendingPermission: () => false },
+      lifecycle: {},
+    });
+
+    const sent: OutboundMessage[] = [];
+    const adapter = createCommandAdapter(sent, { channelType: 'telegram' });
+    const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+
+    await _testOnly.handleMessage(adapter, {
+      messageId: 'msg-tabs-snippets-text',
+      address: { channelType: 'telegram', chatId: 'chat-1' },
+      text: '/tabs',
+      timestamp: Date.now(),
+    });
+
+    assert.equal(sent.length, 1);
+    assert.match(sent[0].text, /user=<code>1234567890123456789…<\/code>/);
+    assert.match(sent[0].text, /agent=<code>abcdefghijklmnopqrs…<\/code>/);
+    assert.doesNotMatch(sent[0].text, /old user message/);
+    assert.doesNotMatch(sent[0].text, /old agent message/);
+    assert.doesNotMatch(sent[0].text, /12345678901234567890/);
+    assert.doesNotMatch(sent[0].text, /abcdefghijklmnopqrst/);
+  });
+
+  it('/tabs overlays bridge state onto the matching backend session identity', async () => {
+    writeJsonl(path.join(process.env.CTI_CODEX_SESSIONS_DIR!, '2026', '06', 'shared.jsonl'), [
+      {
+        timestamp: '2026-06-02T00:00:00.000Z',
+        type: 'session_meta',
+        payload: { id: 'codex-shared-thread', cwd: 'C:\\native' },
+      },
+      {
+        timestamp: '2026-06-02T00:01:00.000Z',
+        type: 'response_item',
+        payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'shared backend session question' }] },
+      },
+      {
+        timestamp: '2026-06-02T00:02:00.000Z',
+        type: 'response_item',
+        payload: { type: 'agent_message', role: 'assistant', content: [{ type: 'output_text', text: 'shared backend session answer' }] },
+      },
+    ]);
+
+    const bridgeTab = createSessionTab('bridge-session', 'codex', '2026-01-01T00:00:00.000Z');
+    bridgeTab.sdkSessionId = 'codex-shared-thread';
+    bridgeTab.backendSdkSessionIds = { codex: 'codex-shared-thread' };
+    const { store, binding, sessions } = createCommandStore({
+      codepilotSessionId: 'bridge-session',
+      sdkSessionId: 'codex-shared-thread',
+      backend: 'codex',
+      backendSessionIds: { codex: 'bridge-session' },
+      backendSdkSessionIds: { codex: 'codex-shared-thread' },
+      sessionTabs: [bridgeTab],
+      activeSessionTabId: 'bridge-session',
+    });
+    initBridgeContext({
+      store,
+      llm: { streamChat: () => new ReadableStream() },
+      permissions: { resolvePendingPermission: () => false },
+      lifecycle: {},
+    });
+
+    const sent: OutboundMessage[] = [];
+    const adapter = createCommandAdapter(sent);
+    const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+
+    await _testOnly.handleMessage(adapter, {
+      messageId: 'msg-tabs-overlay',
+      address: { channelType: 'feishu', chatId: 'chat-1' },
+      text: '/tabs 10',
+      timestamp: Date.now(),
+    });
+
+    assert.equal((sent[0].text.match(/^\d+\./gm) ?? []).length, 1);
+    assert.match(sent[0].text, /codex-shared-thread/);
+    assert.doesNotMatch(sent[0].text, /native:c/);
+    assert.equal(binding.codepilotSessionId, 'bridge-session');
+
+    await _testOnly.handleMessage(adapter, {
+      messageId: 'msg-tab-overlay',
+      address: { channelType: 'feishu', chatId: 'chat-1' },
+      text: '/tab 1',
+      timestamp: Date.now(),
+    });
+
+    assert.equal(binding.codepilotSessionId, 'bridge-session');
+    assert.equal(sessions.size, 1);
+  });
+
   it('/tabs does not refresh tab activity timestamps while listing', async () => {
     const originalUpdatedAt = '2026-01-01T00:00:00.000Z';
     const { store, binding } = createCommandStore({
@@ -956,6 +1355,46 @@ describe('bridge-manager commands — native session routing', () => {
     });
 
     assert.equal(binding.sessionTabs?.[0]?.updatedAt, originalUpdatedAt);
+  });
+
+  it('/tabs ignores non-chat metadata updates when ordering recent sessions', async () => {
+    const activeTab = createSessionTab('codex-active-session', 'codex', '2026-01-01T00:00:00.000Z');
+    const recentChatTab = createSessionTab('codex-recent-chat-session', 'codex', '2026-06-01T00:00:00.000Z');
+    const { store, binding, sessions } = createCommandStore({
+      codepilotSessionId: 'codex-active-session',
+      backend: 'codex',
+      backendSessionIds: { codex: 'codex-active-session' },
+      sessionTabs: [activeTab, recentChatTab],
+      activeSessionTabId: 'codex-active-session',
+    });
+    sessions.set('codex-recent-chat-session', { id: 'codex-recent-chat-session', working_directory: 'C:\\global', model: '' });
+    initBridgeContext({
+      store,
+      llm: { streamChat: () => new ReadableStream() },
+      permissions: { resolvePendingPermission: () => false },
+      lifecycle: {},
+    });
+
+    const sent: OutboundMessage[] = [];
+    const adapter = createCommandAdapter(sent);
+    const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+
+    await _testOnly.handleMessage(adapter, {
+      messageId: 'msg-cwd',
+      address: { channelType: 'feishu', chatId: 'chat-1' },
+      text: '/cwd C:\\changed',
+      timestamp: Date.now(),
+    });
+    await _testOnly.handleMessage(adapter, {
+      messageId: 'msg-tabs-after-cwd',
+      address: { channelType: 'feishu', chatId: 'chat-1' },
+      text: '/tabs 2',
+      timestamp: Date.now(),
+    });
+
+    assert.equal(binding.sessionTabs?.find((tab) => tab.id === 'codex-active-session')?.activityAt, '2026-01-01T00:00:00.000Z');
+    assert.match(sent[1].text, /1\. <code>codex-recent-chat-session<\/code> backend=<b>codex<\/b> cwd=<code>C:\\global<\/code> status=<b>completed<\/b>/);
+    assert.match(sent[1].text, /2\. <code>codex-active-session<\/code> backend=<b>codex<\/b> cwd=<code>C:\\changed<\/code> status=<b>completed<\/b>/);
   });
 
   it('/tab switches using the same current-backend recent ordering as /tabs', async () => {
@@ -1007,6 +1446,229 @@ describe('bridge-manager commands — native session routing', () => {
     assert.equal(binding.sessionTabs?.some((tab) => tab.id === 'codex-global-newest-session'), true);
     assert.match(sent[0].text, /codex-global-newest-session/);
     assert.doesNotMatch(sent[0].text, /claude-current-binding-session/);
+  });
+
+  it('/backend activates the most recent global target-backend chat session', async () => {
+    const { store, binding, sessions } = createCommandStore({
+      codepilotSessionId: 'claude-active-session',
+      backend: 'claudecode',
+      backendSessionIds: {
+        claudecode: 'claude-active-session',
+        codex: 'codex-old-lane-session',
+      },
+      sessionTabs: [
+        createSessionTab('claude-active-session', 'claudecode', '2026-06-01T00:00:00.000Z'),
+        createSessionTab('codex-old-lane-session', 'codex', '2026-01-01T00:00:00.000Z'),
+      ],
+      activeSessionTabId: 'claude-active-session',
+    });
+    const otherBinding: ChannelBinding = {
+      ...binding,
+      id: 'binding-2',
+      chatId: 'chat-2',
+      codepilotSessionId: 'codex-global-recent-session',
+      backend: 'codex',
+      backendSessionIds: { codex: 'codex-global-recent-session' },
+      sessionTabs: [createSessionTab('codex-global-recent-session', 'codex', '2026-06-02T00:00:00.000Z')],
+      activeSessionTabId: 'codex-global-recent-session',
+    };
+    sessions.set('codex-old-lane-session', { id: 'codex-old-lane-session', working_directory: 'C:\\old', model: '' });
+    sessions.set('codex-global-recent-session', { id: 'codex-global-recent-session', working_directory: 'C:\\global', model: '' });
+    (store as any).listChannelBindings = () => [binding, otherBinding];
+    initBridgeContext({
+      store,
+      llm: { streamChat: () => new ReadableStream() },
+      permissions: { resolvePendingPermission: () => false },
+      lifecycle: {},
+    });
+
+    const sent: OutboundMessage[] = [];
+    const adapter = createCommandAdapter(sent);
+    const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+
+    await _testOnly.handleMessage(adapter, {
+      messageId: 'msg-backend-codex-global',
+      address: { channelType: 'feishu', chatId: 'chat-1' },
+      text: '/backend codex',
+      timestamp: Date.now(),
+    });
+
+    assert.equal(binding.backend, 'codex');
+    assert.equal(binding.codepilotSessionId, 'codex-global-recent-session');
+    assert.equal(binding.activeSessionTabId, 'codex-global-recent-session');
+    assert.equal(binding.backendSessionIds?.codex, 'codex-global-recent-session');
+    assert.equal(binding.sessionTabs?.some((tab) => tab.id === 'codex-global-recent-session'), true);
+    assert.equal(sessions.size, 3);
+  });
+
+  it('/backend orders candidates by activityAt instead of non-chat updatedAt', async () => {
+    const activeCodexTab = createSessionTab('codex-active-session', 'codex', '2026-01-01T00:00:00.000Z');
+    activeCodexTab.updatedAt = '2026-06-03T00:00:00.000Z';
+    const recentChatTab = createSessionTab('codex-recent-chat-session', 'codex', '2026-06-01T00:00:00.000Z');
+    const { store, binding, sessions } = createCommandStore({
+      codepilotSessionId: 'claude-active-session',
+      backend: 'claudecode',
+      backendSessionIds: {
+        claudecode: 'claude-active-session',
+        codex: 'codex-active-session',
+      },
+      sessionTabs: [
+        createSessionTab('claude-active-session', 'claudecode', '2026-06-02T00:00:00.000Z'),
+        activeCodexTab,
+        recentChatTab,
+      ],
+      activeSessionTabId: 'claude-active-session',
+    });
+    sessions.set('codex-active-session', { id: 'codex-active-session', working_directory: 'C:\\active', model: '' });
+    sessions.set('codex-recent-chat-session', { id: 'codex-recent-chat-session', working_directory: 'C:\\recent', model: '' });
+    initBridgeContext({
+      store,
+      llm: { streamChat: () => new ReadableStream() },
+      permissions: { resolvePendingPermission: () => false },
+      lifecycle: {},
+    });
+
+    const sent: OutboundMessage[] = [];
+    const adapter = createCommandAdapter(sent);
+    const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+
+    await _testOnly.handleMessage(adapter, {
+      messageId: 'msg-backend-codex-activity',
+      address: { channelType: 'feishu', chatId: 'chat-1' },
+      text: '/backend codex',
+      timestamp: Date.now(),
+    });
+
+    assert.equal(binding.backend, 'codex');
+    assert.equal(binding.codepilotSessionId, 'codex-recent-chat-session');
+    assert.equal(binding.activeSessionTabId, 'codex-recent-chat-session');
+    assert.equal(binding.backendSessionIds?.codex, 'codex-recent-chat-session');
+    assert.equal(binding.sessionTabs?.find((tab) => tab.id === 'codex-active-session')?.activityAt, '2026-01-01T00:00:00.000Z');
+  });
+
+  it('/backend ignores a newer empty target-backend lane when a chat candidate exists', async () => {
+    const emptyCodexLane = createSessionTab('codex-empty-lane', 'codex', '2026-06-05T00:00:00.000Z');
+    delete emptyCodexLane.activityAt;
+    const chatCodexTab = createSessionTab('codex-chat-session', 'codex', '2026-06-01T00:00:00.000Z');
+    const { store, binding, sessions } = createCommandStore({
+      codepilotSessionId: 'claude-active-session',
+      backend: 'claudecode',
+      backendSessionIds: {
+        claudecode: 'claude-active-session',
+        codex: 'codex-empty-lane',
+      },
+      sessionTabs: [
+        createSessionTab('claude-active-session', 'claudecode', '2026-06-02T00:00:00.000Z'),
+        emptyCodexLane,
+        chatCodexTab,
+      ],
+      activeSessionTabId: 'claude-active-session',
+    });
+    sessions.set('codex-empty-lane', { id: 'codex-empty-lane', working_directory: 'C:\\empty', model: '' });
+    sessions.set('codex-chat-session', { id: 'codex-chat-session', working_directory: 'C:\\chat', model: '' });
+    initBridgeContext({
+      store,
+      llm: { streamChat: () => new ReadableStream() },
+      permissions: { resolvePendingPermission: () => false },
+      lifecycle: {},
+    });
+
+    const sent: OutboundMessage[] = [];
+    const adapter = createCommandAdapter(sent);
+    const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+
+    await _testOnly.handleMessage(adapter, {
+      messageId: 'msg-backend-codex-empty-lane',
+      address: { channelType: 'feishu', chatId: 'chat-1' },
+      text: '/backend codex',
+      timestamp: Date.now(),
+    });
+
+    assert.equal(binding.backend, 'codex');
+    assert.equal(binding.codepilotSessionId, 'codex-chat-session');
+    assert.equal(binding.activeSessionTabId, 'codex-chat-session');
+    assert.equal(binding.backendSessionIds?.codex, 'codex-chat-session');
+    assert.equal(binding.sessionTabs?.find((tab) => tab.id === 'codex-empty-lane')?.activityAt, undefined);
+  });
+
+  it('/backend materializes and activates the most recent native target-backend session', async () => {
+    writeJsonl(path.join(process.env.CTI_CODEX_SESSIONS_DIR!, '2026', '06', 'native-backend.jsonl'), [
+      {
+        timestamp: '2026-06-04T00:00:00.000Z',
+        type: 'session_meta',
+        payload: { id: 'codex-native-backend-thread', cwd: 'C:\\native-backend' },
+      },
+      {
+        timestamp: '2026-06-04T00:01:00.000Z',
+        type: 'response_item',
+        payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'native backend switch question' }] },
+      },
+    ]);
+    const { store, binding, sessions } = createCommandStore({
+      codepilotSessionId: 'claude-active-session',
+      backend: 'claudecode',
+      backendSessionIds: { claudecode: 'claude-active-session' },
+      sessionTabs: [createSessionTab('claude-active-session', 'claudecode', '2026-06-01T00:00:00.000Z')],
+      activeSessionTabId: 'claude-active-session',
+    });
+    initBridgeContext({
+      store,
+      llm: { streamChat: () => new ReadableStream() },
+      permissions: { resolvePendingPermission: () => false },
+      lifecycle: {},
+    });
+
+    const sent: OutboundMessage[] = [];
+    const adapter = createCommandAdapter(sent);
+    const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+
+    await _testOnly.handleMessage(adapter, {
+      messageId: 'msg-backend-codex-native',
+      address: { channelType: 'feishu', chatId: 'chat-1' },
+      text: '/backend codex',
+      timestamp: Date.now(),
+    });
+
+    assert.equal(binding.backend, 'codex');
+    assert.notEqual(binding.codepilotSessionId, 'codex-native-backend-thread');
+    assert.equal(binding.sdkSessionId, 'codex-native-backend-thread');
+    assert.equal(binding.backendSdkSessionIds?.codex, 'codex-native-backend-thread');
+    assert.equal(binding.backendSessionIds?.codex, binding.codepilotSessionId);
+    assert.equal(sessions.get(binding.codepilotSessionId)?.sdkSessionId, 'codex-native-backend-thread');
+    assert.equal(binding.workingDirectory, 'C:\\native-backend');
+  });
+
+  it('/backend creates a new target-backend lane when there are no candidates', async () => {
+    const { store, binding, sessions } = createCommandStore({
+      codepilotSessionId: 'claude-active-session',
+      backend: 'claudecode',
+      backendSessionIds: { claudecode: 'claude-active-session' },
+      sessionTabs: [createSessionTab('claude-active-session', 'claudecode', '2026-06-01T00:00:00.000Z')],
+      activeSessionTabId: 'claude-active-session',
+    });
+    initBridgeContext({
+      store,
+      llm: { streamChat: () => new ReadableStream() },
+      permissions: { resolvePendingPermission: () => false },
+      lifecycle: {},
+    });
+
+    const sent: OutboundMessage[] = [];
+    const adapter = createCommandAdapter(sent);
+    const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+
+    await _testOnly.handleMessage(adapter, {
+      messageId: 'msg-backend-codex-new-lane',
+      address: { channelType: 'feishu', chatId: 'chat-1' },
+      text: '/backend codex',
+      timestamp: Date.now(),
+    });
+
+    assert.equal(binding.backend, 'codex');
+    assert.match(binding.codepilotSessionId, /^created-session-/);
+    assert.equal(binding.backendSessionIds?.codex, binding.codepilotSessionId);
+    assert.equal(binding.backendSdkSessionIds?.codex, undefined);
+    assert.equal(sessions.size, 2);
   });
 
   it('/tab only accepts indexes from the last /tabs listing', async () => {
@@ -1110,6 +1772,7 @@ describe('bridge-manager commands — native session routing', () => {
       status: 'completed',
       bufferedResponseText: 'background result',
       unread: true,
+      activityAt: new Date().toISOString(),
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
     };
@@ -1175,6 +1838,7 @@ describe('bridge-manager commands — native session routing', () => {
       sandboxLevel: 'rw',
       status: 'idle',
       unread: true,
+      activityAt: new Date().toISOString(),
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
     };
@@ -1405,12 +2069,306 @@ describe('bridge-manager commands — native session routing', () => {
     assert.equal(card.schema, '2.0');
     assert.equal(card.header.title.content, '✅ 最后答复');
     assert.match(card.body.elements[0].content, /final answer/);
-    const note = card.body.elements.at(-1);
-    assert.equal(note.tag, 'note');
-    assert.match(JSON.stringify(note), /Tokens: 12 in/);
-    assert.match(JSON.stringify(note), /7 out/);
-    assert.match(JSON.stringify(note), /5 cached/);
-    assert.match(JSON.stringify(note), /Model: gpt-test/);
+    assert.doesNotMatch(JSON.stringify(card), /"tag":"note"/);
+    const footer = card.body.elements.at(-1);
+    assert.equal(footer.tag, 'markdown');
+    assert.match(footer.content, /Tokens: 12 in/);
+    assert.match(footer.content, /7 out/);
+    assert.match(footer.content, /5 cached/);
+    assert.match(footer.content, /Model: gpt-test/);
+  });
+
+  it('/peek returns a Feishu Session Peek card with the model summary', async () => {
+    const nativeSessionId = 'codex-peek-thread';
+    writeJsonl(path.join(process.env.CTI_CODEX_SESSIONS_DIR!, '2026', '06', 'peek.jsonl'), [
+      { timestamp: '2026-06-02T00:00:00.000Z', type: 'session_meta', payload: { id: nativeSessionId, cwd: 'C:\\native\\peek' } },
+      { timestamp: '2026-06-02T00:01:00.000Z', type: 'response_item', payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'Add a /peek command to the bridge.' }] } },
+      { timestamp: '2026-06-02T00:02:00.000Z', type: 'response_item', payload: { type: 'function_call', name: 'Edit', arguments: '{"file":"bridge-manager.ts"}' } },
+      { timestamp: '2026-06-02T00:03:00.000Z', type: 'response_item', payload: { type: 'agent_message', role: 'assistant', content: [{ type: 'output_text', text: 'Implemented the peek command.' }] } },
+    ]);
+    const { store, binding } = createCommandStore({
+      codepilotSessionId: 'bridge-peek-session',
+      backend: 'codex',
+      sdkSessionId: nativeSessionId,
+      backendSessionIds: { codex: 'bridge-peek-session' },
+      backendSdkSessionIds: { codex: nativeSessionId },
+      sessionTabs: [createSessionTab('bridge-peek-session', 'codex', '2026-06-02T00:03:00.000Z')],
+      activeSessionTabId: 'bridge-peek-session',
+    });
+
+    const calls: StreamChatParams[] = [];
+    initBridgeContext({
+      store,
+      llm: createSearchLlm(calls, () => [{ type: 'text', data: 'The agent is wiring up /peek and just edited bridge-manager.ts.' }]),
+      permissions: { resolvePendingPermission: () => false },
+      lifecycle: {},
+    });
+
+    const sent: OutboundMessage[] = [];
+    const cards: Array<{ cardJson: string; replyToMessageId?: string }> = [];
+    const adapter = createCommandAdapter(sent, {
+      sendInteractiveCard: async (_address, cardJson, replyToMessageId) => {
+        cards.push({ cardJson, replyToMessageId });
+        return { ok: true, messageId: 'peek-card-1' };
+      },
+    });
+    const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+
+    await _testOnly.handleMessage(adapter, {
+      messageId: 'msg-peek-card',
+      address: { channelType: 'feishu', chatId: 'chat-1' },
+      text: '/peek',
+      timestamp: Date.now(),
+    });
+
+    assert.equal(sent.length, 0);
+    assert.equal(cards.length, 1);
+    assert.equal(cards[0].replyToMessageId, 'msg-peek-card');
+    const card = JSON.parse(cards[0].cardJson);
+    assert.equal(card.schema, '2.0');
+    assert.equal(card.header.title.content, '会话快照');
+    const content = JSON.stringify(card);
+    assert.match(content, /The agent is wiring up \/peek/);
+    assert.match(content, new RegExp(nativeSessionId));
+    assert.match(content, /tool:Edit/);
+  });
+
+  it('/peek summarizes with an ephemeral session id that is neither the bridge nor native session', async () => {
+    const nativeSessionId = 'codex-peek-ephemeral-thread';
+    writeJsonl(path.join(process.env.CTI_CODEX_SESSIONS_DIR!, '2026', '06', 'peek-ephemeral.jsonl'), [
+      { timestamp: '2026-06-02T00:00:00.000Z', type: 'session_meta', payload: { id: nativeSessionId, cwd: 'C:\\native\\peek' } },
+      { timestamp: '2026-06-02T00:01:00.000Z', type: 'response_item', payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'Investigate the failing test.' }] } },
+      { timestamp: '2026-06-02T00:02:00.000Z', type: 'response_item', payload: { type: 'agent_message', role: 'assistant', content: [{ type: 'output_text', text: 'Looking into it now.' }] } },
+    ]);
+    const { store, binding } = createCommandStore({
+      codepilotSessionId: 'bridge-peek-session',
+      backend: 'codex',
+      sdkSessionId: nativeSessionId,
+      backendSessionIds: { codex: 'bridge-peek-session' },
+      backendSdkSessionIds: { codex: nativeSessionId },
+      sessionTabs: [createSessionTab('bridge-peek-session', 'codex', '2026-06-02T00:02:00.000Z')],
+      activeSessionTabId: 'bridge-peek-session',
+    });
+
+    const calls: StreamChatParams[] = [];
+    initBridgeContext({
+      store,
+      llm: createSearchLlm(calls, () => [{ type: 'text', data: 'Investigating the failing test.' }]),
+      permissions: { resolvePendingPermission: () => false },
+      lifecycle: {},
+    });
+
+    const sent: OutboundMessage[] = [];
+    const adapter = createCommandAdapter(sent, {
+      sendInteractiveCard: async () => ({ ok: true, messageId: 'peek-card-eph' }),
+    });
+    const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+
+    await _testOnly.handleMessage(adapter, {
+      messageId: 'msg-peek-ephemeral',
+      address: { channelType: 'feishu', chatId: 'chat-1' },
+      text: '/peek',
+      timestamp: Date.now(),
+    });
+
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].ephemeral, true);
+    assert.equal(calls[0].sandboxLevel, 'ro');
+    assert.equal(calls[0].permissionMode, 'default');
+    assert.equal(calls[0].effort, 'low');
+    assert.equal(calls[0].sdkSessionId, undefined);
+    assert.equal(calls[0].backendSdkSessionId, undefined);
+    assert.match(calls[0].sessionId, /^peek-binding-1-/);
+    assert.notEqual(calls[0].sessionId, binding.codepilotSessionId);
+    assert.notEqual(calls[0].sessionId, nativeSessionId);
+  });
+
+  it('/peek does not change the active session or native binding', async () => {
+    const nativeSessionId = 'codex-peek-stable-thread';
+    writeJsonl(path.join(process.env.CTI_CODEX_SESSIONS_DIR!, '2026', '06', 'peek-stable.jsonl'), [
+      { timestamp: '2026-06-02T00:00:00.000Z', type: 'session_meta', payload: { id: nativeSessionId, cwd: 'C:\\native\\peek' } },
+      { timestamp: '2026-06-02T00:01:00.000Z', type: 'response_item', payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'Keep working.' }] } },
+      { timestamp: '2026-06-02T00:02:00.000Z', type: 'response_item', payload: { type: 'agent_message', role: 'assistant', content: [{ type: 'output_text', text: 'On it.' }] } },
+    ]);
+    const { store, binding } = createCommandStore({
+      codepilotSessionId: 'bridge-peek-session',
+      backend: 'codex',
+      sdkSessionId: nativeSessionId,
+      backendSessionIds: { codex: 'bridge-peek-session' },
+      backendSdkSessionIds: { codex: nativeSessionId },
+      sessionTabs: [createSessionTab('bridge-peek-session', 'codex', '2026-06-02T00:02:00.000Z')],
+      activeSessionTabId: 'bridge-peek-session',
+    });
+
+    initBridgeContext({
+      store,
+      llm: createSearchLlm([], () => [{ type: 'text', data: 'Still working.' }]),
+      permissions: { resolvePendingPermission: () => false },
+      lifecycle: {},
+    });
+
+    const sent: OutboundMessage[] = [];
+    const adapter = createCommandAdapter(sent, {
+      sendInteractiveCard: async () => ({ ok: true, messageId: 'peek-card-stable' }),
+    });
+    const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+
+    await _testOnly.handleMessage(adapter, {
+      messageId: 'msg-peek-stable',
+      address: { channelType: 'feishu', chatId: 'chat-1' },
+      text: '/peek',
+      timestamp: Date.now(),
+    });
+
+    assert.equal(binding.codepilotSessionId, 'bridge-peek-session');
+    assert.equal(binding.activeSessionTabId, 'bridge-peek-session');
+    assert.equal(binding.sdkSessionId, nativeSessionId);
+    assert.equal(binding.backendSdkSessionIds?.codex, nativeSessionId);
+  });
+
+  it('/peek truncates a long transcript before sending it to the summarizer', async () => {
+    const nativeSessionId = 'codex-peek-long-thread';
+    const rows: unknown[] = [
+      { timestamp: '2026-06-02T00:00:00.000Z', type: 'session_meta', payload: { id: nativeSessionId, cwd: 'C:\\native\\peek' } },
+    ];
+    for (let index = 0; index < 30; index += 1) {
+      const marker = index === 0 ? 'OLDEST_MARKER ' : index === 29 ? 'NEWEST_MARKER ' : '';
+      rows.push({
+        timestamp: new Date(Date.UTC(2026, 5, 2, 0, index, 0)).toISOString(),
+        type: 'response_item',
+        payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text: `${marker}${'x'.repeat(400)}` }] },
+      });
+    }
+    writeJsonl(path.join(process.env.CTI_CODEX_SESSIONS_DIR!, '2026', '06', 'peek-long.jsonl'), rows);
+
+    const { store } = createCommandStore({
+      codepilotSessionId: 'bridge-peek-session',
+      backend: 'codex',
+      sdkSessionId: nativeSessionId,
+      backendSessionIds: { codex: 'bridge-peek-session' },
+      backendSdkSessionIds: { codex: nativeSessionId },
+      sessionTabs: [createSessionTab('bridge-peek-session', 'codex', '2026-06-02T00:30:00.000Z')],
+      activeSessionTabId: 'bridge-peek-session',
+    });
+
+    const calls: StreamChatParams[] = [];
+    initBridgeContext({
+      store,
+      llm: createSearchLlm(calls, () => [{ type: 'text', data: 'summary' }]),
+      permissions: { resolvePendingPermission: () => false },
+      lifecycle: {},
+    });
+
+    const sent: OutboundMessage[] = [];
+    const adapter = createCommandAdapter(sent, {
+      sendInteractiveCard: async () => ({ ok: true, messageId: 'peek-card-long' }),
+    });
+    const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+
+    await _testOnly.handleMessage(adapter, {
+      messageId: 'msg-peek-long',
+      address: { channelType: 'feishu', chatId: 'chat-1' },
+      text: '/peek',
+      timestamp: Date.now(),
+    });
+
+    assert.equal(calls.length, 1);
+    // Most recent activity is kept; oldest is dropped by the strict char cap.
+    assert.match(calls[0].prompt, /NEWEST_MARKER/);
+    assert.doesNotMatch(calls[0].prompt, /OLDEST_MARKER/);
+    assert.match(calls[0].prompt, /…/);
+    // Full transcript is ~12k chars; the truncated prompt must stay well under that.
+    assert.ok(calls[0].prompt.length < 7500, `prompt too long: ${calls[0].prompt.length}`);
+  });
+
+  it('/peek falls back to a local summary when the summarizer fails', async () => {
+    const nativeSessionId = 'codex-peek-fallback-thread';
+    writeJsonl(path.join(process.env.CTI_CODEX_SESSIONS_DIR!, '2026', '06', 'peek-fallback.jsonl'), [
+      { timestamp: '2026-06-02T00:00:00.000Z', type: 'session_meta', payload: { id: nativeSessionId, cwd: 'C:\\native\\peek' } },
+      { timestamp: '2026-06-02T00:01:00.000Z', type: 'response_item', payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'Run the failing migration.' }] } },
+      { timestamp: '2026-06-02T00:02:00.000Z', type: 'response_item', payload: { type: 'agent_message', role: 'assistant', content: [{ type: 'output_text', text: 'Migration applied successfully.' }] } },
+    ]);
+    const { store } = createCommandStore({
+      codepilotSessionId: 'bridge-peek-session',
+      backend: 'codex',
+      sdkSessionId: nativeSessionId,
+      backendSessionIds: { codex: 'bridge-peek-session' },
+      backendSdkSessionIds: { codex: nativeSessionId },
+      sessionTabs: [createSessionTab('bridge-peek-session', 'codex', '2026-06-02T00:02:00.000Z')],
+      activeSessionTabId: 'bridge-peek-session',
+    });
+
+    const calls: StreamChatParams[] = [];
+    initBridgeContext({
+      store,
+      llm: createSearchLlm(calls, () => [{ type: 'error', data: 'summarizer unavailable' }]),
+      permissions: { resolvePendingPermission: () => false },
+      lifecycle: {},
+    });
+
+    const sent: OutboundMessage[] = [];
+    const cards: string[] = [];
+    const adapter = createCommandAdapter(sent, {
+      sendInteractiveCard: async (_address, cardJson) => {
+        cards.push(cardJson);
+        return { ok: true, messageId: 'peek-card-fallback' };
+      },
+    });
+    const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+
+    await _testOnly.handleMessage(adapter, {
+      messageId: 'msg-peek-fallback',
+      address: { channelType: 'feishu', chatId: 'chat-1' },
+      text: '/peek',
+      timestamp: Date.now(),
+    });
+
+    assert.equal(calls.length, 1);
+    assert.equal(cards.length, 1);
+    assert.match(cards[0], /本地兜底/);
+    assert.match(cards[0], /Migration applied successfully\./);
+  });
+
+  it('/peek reports when there is no native session yet without calling the summarizer', async () => {
+    const { store, binding } = createCommandStore({
+      codepilotSessionId: 'bridge-peek-fresh',
+      backend: 'codex',
+      sdkSessionId: '',
+      backendSessionIds: { codex: 'bridge-peek-fresh' },
+      backendSdkSessionIds: {},
+      sessionTabs: [createSessionTab('bridge-peek-fresh', 'codex', '2026-06-02T00:00:00.000Z')],
+      activeSessionTabId: 'bridge-peek-fresh',
+    });
+
+    const calls: StreamChatParams[] = [];
+    initBridgeContext({
+      store,
+      llm: createSearchLlm(calls, () => [{ type: 'text', data: 'should not be called' }]),
+      permissions: { resolvePendingPermission: () => false },
+      lifecycle: {},
+    });
+
+    const sent: OutboundMessage[] = [];
+    const cards: string[] = [];
+    const adapter = createCommandAdapter(sent, {
+      sendInteractiveCard: async (_address, cardJson) => {
+        cards.push(cardJson);
+        return { ok: true, messageId: 'peek-card-fresh' };
+      },
+    });
+    const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+
+    await _testOnly.handleMessage(adapter, {
+      messageId: 'msg-peek-fresh',
+      address: { channelType: 'feishu', chatId: 'chat-1' },
+      text: '/peek',
+      timestamp: Date.now(),
+    });
+
+    assert.equal(calls.length, 0);
+    assert.equal(cards.length, 1);
+    assert.match(cards[0], /尚未建立 native session/);
+    assert.equal(binding.codepilotSessionId, 'bridge-peek-fresh');
   });
 });
 
@@ -1536,6 +2494,7 @@ function createSessionTab(
     bufferedResponseText: '',
     bufferedErrorMessage: '',
     unread: false,
+    activityAt: updatedAt,
     createdAt: updatedAt,
     updatedAt,
   };
